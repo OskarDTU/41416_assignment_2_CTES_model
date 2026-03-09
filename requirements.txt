@@ -1,6 +1,11 @@
 # local package
 -e .
 
+# scientific computing
+numpy
+scipy
+matplotlib
+
 # external requirements
 click
 Sphinx
