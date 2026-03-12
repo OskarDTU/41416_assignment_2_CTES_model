@@ -18,7 +18,10 @@ def solar_collector_outlet_temperature(
     ):
     # Calculate absorbed power
     power = dni * efficiency * area  # W
-    t_in_k = t_in + 273.15                          # Convert °C to K for CoolProp
+    if temp_unit == "C":
+        t_in_k = t_in + 273.15                          # Convert °C to K for CoolProp
+    else:
+        t_in_k = t_in                                  # Already in K
     #Calculate output temperature based on absorbed power and mass flow rate as well as specific heat capacity from CoolProp
     if volumetric:
         # Convert volumetric flow to mass flow using density at inlet conditions
