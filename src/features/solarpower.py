@@ -2,8 +2,8 @@
 from CoolProp.CoolProp import PropsSI
 
 # function for cp as a function of T
-def cp(T):
-    return PropsSI("C", "T", T, "Q", 0, "INCOMP::PNF")
+def cp(T, fluid):
+    return PropsSI("C", "T", T, "Q", 0, fluid)
 
 def solar_collector_outlet_temperature(
     t_in, # inlet temperature (°C by default, or K if `temp_unit` == 'K')
@@ -35,7 +35,7 @@ def solar_collector_outlet_temperature(
     # * integral of cp(T) dT from t_in to t_out.
     t_out_k = t_in_k  # Start with inlet temperature as initial guess
     for _ in range(100):  # Limit iterations to prevent infinite loop
-        cp_avg = (cp(t_in_k) + cp(t_out_k)) / 2  # Average cp between inlet and current outlet guess
+        cp_avg = (cp(t_in_k, fluid) + cp(t_out_k, fluid)) / 2  # Average cp between inlet and current outlet guess
         power_guess = m_dot_mass * cp_avg * (t_out_k - t_in_k)  # Power based on current outlet guess
         if abs(power_guess - power) < 1e-3:  # Check if close enough
             break
