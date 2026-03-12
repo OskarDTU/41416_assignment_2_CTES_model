@@ -5,6 +5,8 @@
 #First, we shall model the thermodynamic process of an energy storage plant
 #We shall look at the charging, storage, and discharging of the storage plant
 
+# %% Import necessary libraries
+
 from typing import Optional, Union
 import pandas as pd
 import numpy as np
@@ -20,7 +22,7 @@ except Exception:
 	except Exception:
 		solar_collector_outlet_temperature = None
 
-# Helper functions for the simulation loop
+# %% Helper functions for the simulation loop
 # Load DNI input from various formats (scalar, Series, or CSV path)
 def _load_dni_input(dni_input: Union[str, float, int, pd.Series]) -> Union[float, pd.Series]:
 	"""Return DNI as float or pandas Series depending on input type."""
@@ -74,13 +76,7 @@ def _ctes_stub_step(state: dict, power_W: float, dt_s: float):
 	return state, available_power
 
 
-#Oil/water heat exchanger model for supplying hot water to the pasta factory. 
-# This is a simple counterflow heat exchanger model that computes the outlet 
-# temperature of the oil and the provided power to the water side based on 
-# the inlet conditions and flow rates. It uses CoolProp to get fluid properties 
-# at inlet conditions but assumes constant cp for simplicity (no integral over T). 
-# The function can also compute the achievable water outlet temperature if a 
-# water flow and target temperature are provided, limiting the provided power accordingly.
+#Oil/water heat exchanger model for supplying hot water to the pasta factory.
 def oil_water_hex(
 	oil_in_C: float,
 	oil_flow_m3s: float,
@@ -161,7 +157,7 @@ def oil_water_hex(
 
 	return float(oil_out_C), float(provided_W), float(water_out_C)
 
-
+#Useless recirculation function that nobody cares about
 def _compute_recirc_fraction(collector_t_out_C: float, htf_in_C: float, max_htf_temp_C: float) -> float:
 	"""Compute a conservative recirculation fraction to limit HTF maximum temperature.
 
@@ -177,16 +173,11 @@ def _compute_recirc_fraction(collector_t_out_C: float, htf_in_C: float, max_htf_
 	frac = num / den
 	return float(np.clip(frac if (frac := num/den) is not None else 0.0, 0.0, 1.0))
 
-# This is the main simulation loop for the solar+CTES+pasta-factory system. It iterates over a time series of 
-# DNI values, computes the solar collector output, determines how much of that can be used to heat the factory 
-# water through an oil-water HEX, and then applies simple logic to charge/discharge the CTES based on 
-# surplus/deficit relative to factory load. The CTES model is currently a stub (completely fucking useless m8) and should be replaced with 
-# Oskar and Federico's detailed model. The function returns a DataFrame with the simulation results.
+# %% Main simulation loop for the solar+CTES+pasta-factory system.
 def simulate(
 	dni_input: Union[str, float, int, pd.Series],
  	collector_efficiency: float = 0.47,
  	collector_area_m2: float = 6000.0,
- 	nominal_hft_vol_flow_m3s: float = 0.019,
  	initial_htf_inlet_temp_C: float = 125.0,
  	max_htf_temp_C: float = 315.0,
  	max_collector_flow_m3s: Optional[float] = None,
@@ -194,6 +185,7 @@ def simulate(
  	max_ctes_flow_m3s: Optional[float] = None,
  	timestep_seconds: int = 600,
  	initial_no_load_hours: float = 48.0,
+	fluid: str = "INCOMP::PNF",
 ):
 	"""High-level simulation loop for the solar+CTES+pasta-factory system.
 
@@ -257,8 +249,8 @@ def simulate(
 		# compute a sensible collector volumetric flow to avoid exceeding max HTF temperature
 		# use HTF properties at inlet temperature
 		try:
-			rho_htf = PropsSI("D", "T", htf_in_temp_C + 273.15, "Q", 0, "INCOMP::PNF")
-			cp_htf = PropsSI("C", "T", htf_in_temp_C + 273.15, "Q", 0, "INCOMP::PNF")
+			rho_htf = PropsSI("D", "T", htf_in_temp_C + 273.15, "Q", 0, fluid)
+			cp_htf = PropsSI("C", "T", htf_in_temp_C + 273.15, "Q", 0, fluid)
 		except Exception:
 			rho_htf = 870.0
 			cp_htf = 2200.0
@@ -280,6 +272,7 @@ def simulate(
 		# ensure non-negative
 		m_col_vol_flow_m3s = float(max(0.0, m_col_vol_flow_m3s))
 
+		# compute collector outlet temperature and actual absorbed power with the given flow
 		try:
 			col_res = solar_collector_outlet_temperature(
 				t_in=htf_in_temp_C,
@@ -336,25 +329,78 @@ def simulate(
 		else:
 			T_mix = htf_in_temp_C
 
-		# if T_mix > T_req, we may need to recirculate cooler oil to lower inlet temperature
+		# compute a conservative recirculation to lower inlet if T_mix > T_req
 		m_recirc = 0.0
 		if T_mix > T_req:
-			# assume recirculation source temperature equals previous HEX outlet or HTF inlet (conservative)
 			T_recirc = htf_in_temp_C
-			if T_recirc < T_mix:
-				# solve for m_recirc such that (denom*T_mix + m_recirc*T_recirc)/(denom + m_recirc) = T_req
-				# rearranged: m_recirc = denom*(T_mix - T_req)/(T_req - T_recirc)
-				if (T_req - T_recirc) > 0:
-					m_recirc = denom * (T_mix - T_req) / (T_req - T_recirc)
-					m_recirc = float(np.clip(m_recirc, 0.0, max(0.0, m_col_avail)))
-				else:
-					m_recirc = 0.0
-			# update denom and T_mix including recirculation
-			denom += m_recirc
-			T_mix = ( (denom - m_recirc) * T_mix + m_recirc * T_recirc ) / denom
+			if T_recirc < T_mix and (T_req - T_recirc) > 0:
+				m_recirc = denom * (T_mix - T_req) / (T_req - T_recirc)
+				m_recirc = float(np.clip(m_recirc, 0.0, max(0.0, m_col_avail)))
+				denom += m_recirc
+				T_mix = ((denom - m_recirc) * T_mix + m_recirc * T_recirc) / denom
 
 		# final oil flow supplied to HEX
 		m_oil_hex = denom
+
+		# --- Automatic reallocation: try to meet required oil inlet temperature by shifting flows ---
+		# compute required oil inlet to fully meet water demand for current allocation
+		reallocated = False
+		if factory_active and m_oil_hex > 0:
+			try:
+				rho_w = PropsSI("D", "T", factory_water_in_C + 273.15, "Q", 0, "Water")
+				cp_w = PropsSI("C", "T", factory_water_in_C + 273.15, "Q", 0, "Water")
+			except Exception:
+				rho_w = 1000.0; cp_w = 4180.0
+			m_w = factory_water_flow_m3s * rho_w
+			desired_W_full = m_w * cp_w * (factory_water_target_C - factory_water_in_C)
+
+			# function to check if current T_mix can satisfy requirement
+			def _check_hex_sufficiency(Tmix, mol_hex):
+				try:
+					rho_o = PropsSI("D", "T", Tmix + 273.15, "Q", 0, fluid)
+					cp_o = PropsSI("C", "T", Tmix + 273.15, "Q", 0, fluid)
+				except Exception:
+					rho_o = 870.0; cp_o = 2200.0
+				m_dot_o = mol_hex * rho_o
+				oil_out_min = factory_water_target_C + pinch_delta_C
+				if m_dot_o <= 0 or cp_o <= 0:
+					return False, np.nan
+				req_in = oil_out_min + desired_W_full / (m_dot_o * cp_o)
+				return Tmix >= req_in, req_in
+
+			# 1) try increasing CTES flow to its available limit (helps if CTES is hotter than collector)
+			if m_ctes_use < m_ctes_avail:
+				m_ctes_try = m_ctes_avail
+				den = m_col_use + m_ctes_try
+				Tmix_try = (m_col_use * T_col + m_ctes_try * T_ctes) / den if den > 0 else htf_in_temp_C
+				ok, req = _check_hex_sufficiency(Tmix_try, den)
+				if ok:
+					m_ctes_use = m_ctes_try
+					denom = den; T_mix = Tmix_try; m_oil_hex = denom; required_oil_in_C = req; reallocated = True
+
+			# 2) if still not sufficient, try increasing collector use up to available
+			if not reallocated and m_col_use < m_col_avail:
+				m_col_try = m_col_avail
+				den = m_col_try + m_ctes_use
+				Tmix_try = (m_col_try * T_col + m_ctes_use * T_ctes) / den if den > 0 else htf_in_temp_C
+				ok, req = _check_hex_sufficiency(Tmix_try, den)
+				if ok:
+					m_col_use = m_col_try
+					denom = den; T_mix = Tmix_try; m_oil_hex = denom; required_oil_in_C = req; reallocated = True
+
+			# 3) if still not, reduce recirculation to raise T_mix (set m_recirc=0)
+			if not reallocated and m_recirc > 0:
+				den = (m_col_use + m_ctes_use)
+				Tmix_try = (m_col_use * T_col + m_ctes_use * T_ctes) / den if den > 0 else htf_in_temp_C
+				ok, req = _check_hex_sufficiency(Tmix_try, den)
+				if ok:
+					m_recirc = 0.0
+					denom = den; T_mix = Tmix_try; m_oil_hex = denom; required_oil_in_C = req; reallocated = True
+
+			# compute required_oil_in_C for final allocation if not set
+			if not reallocated:
+				ok, req = _check_hex_sufficiency(T_mix, m_oil_hex)
+				required_oil_in_C = req
 
 		# compute required oil inlet temperature to meet the factory water target given m_oil_hex
 		required_oil_in_C = np.nan
@@ -403,8 +449,29 @@ def simulate(
 			water_vol_flow_m3s=(factory_water_flow_m3s if factory_active else None),
 			water_in_C=factory_water_in_C,
 			water_target_C=(factory_water_target_C if factory_active else None),
-			pinch_delta=pinch_delta_C,
+				pinch_delta=pinch_delta_C,
 		)
+
+		# If HEX couldn't meet the full demand and a backup heater would be needed,
+		# allow a relaxed pinch (10 C) and re-evaluate to see if that reduces backup heater use.
+		if factory_active:
+			remaining_deficit = max(0.0, desired_water_power_W - provided_W)
+			if remaining_deficit > 0 and pinch_delta_C > 10:
+				# re-run HEX with relaxed pinch
+				oil_out_C_relaxed, provided_W_relaxed, water_out_C_relaxed = oil_water_hex(
+					oil_in_C=T_mix,
+					oil_flow_m3s=m_oil_hex,
+					desired_water_power_W=desired_water_power_W,
+					water_vol_flow_m3s=factory_water_flow_m3s,
+					water_in_C=factory_water_in_C,
+					water_target_C=factory_water_target_C,
+					pinch_delta=10.0,
+				)
+				# adopt relaxed result if it supplies more
+				if provided_W_relaxed > provided_W:
+					provided_W = provided_W_relaxed
+					oil_out_C = oil_out_C_relaxed
+					water_out_C = water_out_C_relaxed
 
 		# account for provided_W as energy used from HTF (charging/discharging logic follows)
 		# solar contribution to provided_W is proportional to fraction of oil coming from collector
@@ -473,7 +540,7 @@ def simulate(
 	results_df = pd.DataFrame.from_records(records).set_index("timestamp")
 	return results_df
 
-
+# %% Main entry point for the simulation
 if __name__ == "__main__":
 	print("This module provides `simulate()` for running the high-level CTES simulation loop.")
 	print("Call `simulate(dni_series_or_path, ...)` from your scripts or notebooks.")
