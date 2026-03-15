@@ -40,12 +40,11 @@ def solar_collector_outlet_temperature(
         if abs(power_guess - power) < 1e-3:  # Check if close enough
             break
         t_out_k += (power - power_guess) / (m_dot_mass * cp_avg)  # Adjust outlet temperature guess
-        print(t_out_k-273.15)  # Debug: print current outlet temperature guess in °C
     
     if t_out_k < t_in_k:
         raise ValueError(f"Computed outlet temperature {t_out_k-273.15:.2f} °C is less than inlet temperature {t_in_k-273.15:.2f} °C, which is non-physical. Check inputs.")
     return {"power_W": power, "t_out_C": t_out_k-273.15}
-
+"""
 # Example usage
 if __name__ == "__main__":
     results = solar_collector_outlet_temperature(
@@ -58,3 +57,4 @@ if __name__ == "__main__":
         temp_unit="C",
     )
     print(results)
+"""

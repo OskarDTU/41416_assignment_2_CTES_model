@@ -55,3 +55,25 @@ A_LFC_module = 30.50
 
 # Total soil surface [m^2]
 A_soil_total = 10100
+
+# ------------------------------------------------------------------
+# Fluid and operating properties (moved from ctes_1d_jian)
+# ------------------------------------------------------------------
+# Paratherm-NF (typical reference properties around 200 C)
+rho_f = 780.0    # [kg/m3]
+Cp_f  = 2200.0   # [J/(kg·K)]
+mu_f  = 0.5e-3   # [Pa·s]
+k_f   = 0.12     # [W/(m·K)]
+
+# Operating temperatures and environment
+T_min = 136.0    # [C]  minimum operating temperature (return oil)
+T_max = 280.0    # [C]  maximum operating temperature (from solar field)
+T_amb = 30.0     # [C]  ambient temperature
+v_wind = 3.0     # [m/s]
+sigma = 5.670e-8 # [W/(m2·K4)]
+
+# Total oil flow rate (Buscemi et al.)
+Q_vol_total = 0.019                       # [m3/s] total volumetric flow rate
+
+# Equivalent element count used for scaling
+n_pipes = 818

@@ -39,6 +39,9 @@ from src.data.constants import (
     lambda_iso, th_iso, epsilon_iso,
     V_con, n_modules,
     module_width, module_height, module_length,
+    rho_f, Cp_f, mu_f, k_f,
+    T_min, T_max, T_amb, v_wind, sigma,
+    Q_vol_total, n_pipes,
 )
 
 # =============================================================================
@@ -69,38 +72,23 @@ H_con     = module_height - 2 * th_iso
 S_con_ext = 2 * (W_con * L_module + H_con * L_module)
 S_iso_ext = 2 * (module_width * L_module + module_height * L_module)
 
-# =============================================================================
-# FLUID PROPERTIES — Paratherm-NF thermal oil at ~200 C
-# =============================================================================
-rho_f = 780.0    # [kg/m3]
-Cp_f  = 2200.0   # [J/(kg·K)]
-mu_f  = 0.5e-3   # [Pa·s]
-k_f   = 0.12     # [W/(m·K)]
-Pr_f  = mu_f * Cp_f / k_f
+# Derived parameters from constants
+Pr_f = mu_f * Cp_f / k_f
 
-# =============================================================================
-# OPERATING CONDITIONS
-# =============================================================================
-T_min   = 136.0    # [C]  minimum operating temperature (return oil)
-T_max   = 280.0    # [C]  maximum operating temperature (from solar field)
-T_amb   = 30.0     # [C]  ambient temperature
-v_wind  = 3.0      # [m/s]
-sigma   = 5.670e-8 # [W/(m2·K4)]
-
-# Total oil flow rate (Buscemi et al.)
-Q_vol_total = 0.019                       # [m3/s] total volumetric flow rate
+# Total oil flow rate and per-element mass flows
 m_dot_total = rho_f * Q_vol_total         # [kg/s] total mass flow rate
 m_dot_eq    = m_dot_total / n_pipes       # [kg/s] flow rate per equivalent element
 
-print("=" * 55)
-print("EQUIVALENT ELEMENT GEOMETRY")
-print("=" * 55)
-print(f"  V_eq  (concrete)     = {V_eq*1e6:.2f} cm3")
-print(f"  a = r_pipe_out       = {r_pipe_out*1e3:.2f} mm  (inner radius of solid)")
-print(f"  b = r_eq             = {r_eq*1e3:.2f} mm  (outer equivalent radius)")
-print(f"  S_s (solid section)  = {S_s*1e6:.1f} mm2")
-print(f"  S_f (fluid section)  = {S_f*1e6:.1f} mm2")
-print(f"  m_dot per element    = {m_dot_eq*1e3:.3f} g/s")
+if __name__ == "__main__":
+    print("=" * 55)
+    print("EQUIVALENT ELEMENT GEOMETRY")
+    print("=" * 55)
+    print(f"  V_eq  (concrete)     = {V_eq*1e6:.2f} cm3")
+    print(f"  a = r_pipe_out       = {r_pipe_out*1e3:.2f} mm  (inner radius of solid)")
+    print(f"  b = r_eq             = {r_eq*1e3:.2f} mm  (outer equivalent radius)")
+    print(f"  S_s (solid section)  = {S_s*1e6:.1f} mm2")
+    print(f"  S_f (fluid section)  = {S_f*1e6:.1f} mm2")
+    print(f"  m_dot per element    = {m_dot_eq*1e3:.3f} g/s")
 
 # =============================================================================
 # EFFECTIVE HEAT TRANSFER COEFFICIENT h_E  (Jian et al. eq. 3.50)
@@ -145,14 +133,15 @@ def compute_h_E(m_dot_per_element):
 
     return h_E, h, Re
 
-h_E_ref, h_ref, Re_ref = compute_h_E(m_dot_eq)
-print(f"\n{'='*55}")
-print("HEAT TRANSFER COEFFICIENTS  (T_fluid = 200 C)")
-print(f"{'='*55}")
-print(f"  Re  = {Re_ref:.0f}  ({'turbulent' if Re_ref>4000 else 'transitional/laminar'})")
-print(f"  h   = {h_ref:.2f} W/(m2·K)  (convection only)")
-print(f"  h_E = {h_E_ref:.2f} W/(m2·K)  (convection + conduction correction)")
-print(f"  Reduction = {(1-h_E_ref/h_ref)*100:.1f}%  due to radial conduction resistance")
+if __name__ == "__main__":
+    h_E_ref, h_ref, Re_ref = compute_h_E(m_dot_eq)
+    print(f"\n{'='*55}")
+    print("HEAT TRANSFER COEFFICIENTS  (T_fluid = 200 C)")
+    print(f"{'='*55}")
+    print(f"  Re  = {Re_ref:.0f}  ({'turbulent' if Re_ref>4000 else 'transitional/laminar'})")
+    print(f"  h   = {h_ref:.2f} W/(m2·K)  (convection only)")
+    print(f"  h_E = {h_E_ref:.2f} W/(m2·K)  (convection + conduction correction)")
+    print(f"  Reduction = {(1-h_E_ref/h_ref)*100:.1f}%  due to radial conduction resistance")
 
 # =============================================================================
 # HEAT LOSS MODEL  (Buscemi et al. eq. 14-19)
@@ -259,7 +248,7 @@ def extract_profiles(y):
 def stored_energy(y, T_ref=T_min):
     """Energy stored in one module [MWh]."""
     _, T_s = extract_profiles(y)
-    E = rho_con * Cp_con * S_s * n_pipes * np.trapezoid(T_s - T_ref, z_nodes)
+    E = rho_con * Cp_con * S_s * n_pipes * np.trapz(T_s - T_ref, z_nodes)
     return E / 3.6e9
 
 def SOC(y):
@@ -272,6 +261,72 @@ def T_outlet(y, mode):
     T_f, _ = extract_profiles(y)
     return T_f[-1] if mode == 'charging' else T_f[0]
 
+
+# ---------------------------------------------------------------------------
+# Convenience helpers for integrating the CTES model from external code
+# ---------------------------------------------------------------------------
+def init_ctes_state(T_init=None):
+    """Return an initial state vector `y` for the CTES model.
+
+    - `T_init` if provided sets all temperatures to that value (C). Otherwise uses `T_min`.
+    """
+    T0 = T_min if T_init is None else float(T_init)
+    return np.full(2 * N_z, T0)
+
+
+def stored_energy_J(y, T_ref=None):
+    """Return stored energy (J) for all modules relative to `T_ref` (defaults to T_min).
+
+    This mirrors `stored_energy()` but returns Joules and includes all `n_modules`.
+    """
+    if T_ref is None:
+        T_ref = T_min
+    _, T_s = extract_profiles(y)
+    E = rho_con * Cp_con * S_s * n_pipes * np.trapz(T_s - T_ref, z_nodes)
+    return float(E * n_modules)
+
+
+def step_ctes(y_curr, T_in_C, m_dot_total_kg_s, mode, dt_seconds, rtol=1e-5, atol=1e-7):
+    """Integrate the CTES 1D model for `dt_seconds`.
+
+    Parameters
+    - y_curr: current state vector
+    - T_in_C: inlet fluid temperature (C)
+    - m_dot_total_kg_s: total mass flow rate (kg/s) through the storage (use 0 for storage mode)
+    - mode: 'charging', 'discharging', or 'storage'
+    - dt_seconds: timestep seconds
+
+    Returns dict with keys: `y`, `T_out_C`, `energy_J`, `SOC`.
+    """
+    if mode not in ('charging', 'discharging', 'storage'):
+        raise ValueError("mode must be 'charging', 'discharging', or 'storage'")
+
+    # For charging/discharging, ensure a small positive mass flow is provided.
+    if mode in ('charging', 'discharging') and (m_dot_total_kg_s is None or m_dot_total_kg_s <= 0):
+        # fall back to storage-only step (no advection)
+        mode_use = 'storage'
+    else:
+        mode_use = mode
+
+    T_in_val = float(T_in_C) if (T_in_C is not None) else float(T_min)
+    m_dot_val = float(m_dot_total_kg_s) if (m_dot_total_kg_s is not None) else 0.0
+    sol = solve_ivp(
+        ctes_1d_rhs,
+        [0.0, float(dt_seconds)],
+        y_curr,
+        args=(T_in_val, m_dot_val, mode_use),
+        method='Radau',
+        rtol=rtol,
+        atol=atol,
+    )
+    y_new = sol.y[:, -1]
+
+    E_J = stored_energy_J(y_new)
+    soc = SOC(y_new)
+    T_out = T_outlet(y_new, mode_use)
+    return {"y": y_new, "T_out_C": float(T_out), "energy_J": float(E_J), "SOC": float(soc)}
+
+"""
 # =============================================================================
 # SIMULATION: weekly cycle
 # =============================================================================
@@ -279,7 +334,7 @@ T_in_charging    = 280.0   # [C] oil from solar field
 T_in_discharging = 136.0   # [C] return oil from pasta factory
 
 def get_mode(t_hours):
-    """Return (mode, T_in) as a function of hour of the week."""
+    #Return (mode, T_in) as a function of hour of the week.
     day     = int(t_hours // 24)
     hour    = t_hours % 24
     weekend = day < 2
@@ -377,3 +432,4 @@ output_path = os.path.join(os.path.dirname(__file__), 'ctes_1d_jian_results.png'
 plt.savefig(output_path, dpi=150, bbox_inches='tight')
 plt.show()
 print(f"Plot saved: {output_path}")
+"""
