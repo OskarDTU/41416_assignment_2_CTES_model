@@ -262,6 +262,18 @@ def T_outlet(y, mode):
     return T_f[-1] if mode == 'charging' else T_f[0]
 
 
+def heat_loss_W(y):
+    """Instantaneous CTES thermal loss to ambient [W] for all modules.
+
+    This uses the same `Q_loss_module` formulation as the ODE source term and
+    aggregates losses over axial nodes and modules.
+    """
+    _, T_s = extract_profiles(y)
+    # Match discretization used in rhs: node-wise loss distributed over module length.
+    loss_one_module_W = float(np.sum([Q_loss_module(float(T_s_j), T_amb, v_wind) for T_s_j in T_s]) * dz / L_module)
+    return loss_one_module_W * n_modules
+
+
 # ---------------------------------------------------------------------------
 # Convenience helpers for integrating the CTES model from external code
 # ---------------------------------------------------------------------------

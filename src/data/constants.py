@@ -66,8 +66,8 @@ mu_f  = 0.5e-3   # [Pa·s]
 k_f   = 0.12     # [W/(m·K)]
 
 # Operating temperatures and environment
-T_min = 136.0    # [C]  minimum operating temperature (return oil)
-T_max = 280.0    # [C]  maximum operating temperature (from solar field)
+T_min = 130.0    # [C]  minimum operating temperature (return oil)
+T_max = 310.0    # [C]  maximum operating temperature (from solar field)
 T_amb = 30.0     # [C]  ambient temperature
 v_wind = 3.0     # [m/s]
 sigma = 5.670e-8 # [W/(m2·K4)]

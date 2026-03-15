@@ -16,8 +16,8 @@ def solar_collector_outlet_temperature(
     density_override=None, # optional fluid density (kg/m^3) for volumetric flow
     temp_unit="C", # 'C' or 'K' indicating units of `t_in`
     ):
-    # Calculate absorbed power
-    power = dni * efficiency * area  # W
+    # Calculate potential absorbed power from solar field.
+    power = max(0.0, dni * efficiency * area)  # W
     if temp_unit == "C":
         t_in_k = t_in + 273.15                          # Convert °C to K for CoolProp
     else:
@@ -29,21 +29,54 @@ def solar_collector_outlet_temperature(
         m_dot_mass = m_dot * rho                        # Convert volumetric flow (m^3/s) to mass flow (kg/s)
     else:
         m_dot_mass = m_dot
-    #Calculate outlet temperature taking changing specific heat into account using an integral approach
-    # We can use a numerical approach to solve for t_out since cp is a function of temperature.
-    # We can use a simple iterative method to find t_out such that power = m_dot
-    # * integral of cp(T) dT from t_in to t_out.
-    t_out_k = t_in_k  # Start with inlet temperature as initial guess
-    for _ in range(100):  # Limit iterations to prevent infinite loop
-        cp_avg = (cp(t_in_k, fluid) + cp(t_out_k, fluid)) / 2  # Average cp between inlet and current outlet guess
-        power_guess = m_dot_mass * cp_avg * (t_out_k - t_in_k)  # Power based on current outlet guess
-        if abs(power_guess - power) < 1e-3:  # Check if close enough
-            break
-        t_out_k += (power - power_guess) / (m_dot_mass * cp_avg)  # Adjust outlet temperature guess
-    
-    if t_out_k < t_in_k:
-        raise ValueError(f"Computed outlet temperature {t_out_k-273.15:.2f} °C is less than inlet temperature {t_in_k-273.15:.2f} °C, which is non-physical. Check inputs.")
-    return {"power_W": power, "t_out_C": t_out_k-273.15}
+
+    # No heating possible if no flow or no irradiance.
+    if m_dot_mass <= 0 or power <= 0:
+        return {"power_W": 0.0, "t_out_C": t_in_k - 273.15}
+
+    # Bound temperature solve to CoolProp fluid validity range.
+    try:
+        t_min = PropsSI("Tmin", "", 0, "", 0, fluid)
+        t_max = PropsSI("Tmax", "", 0, "", 0, fluid)
+    except Exception:
+        t_min = 250.0
+        t_max = 650.0
+
+    t_in_k = float(min(max(t_in_k, t_min + 1e-6), t_max - 1e-6))
+
+    def _cp_safe(Tk):
+        Tk_b = min(max(float(Tk), t_min + 1e-6), t_max - 1e-6)
+        return cp(Tk_b, fluid)
+
+    def _power_to_fluid(T_out_k_local):
+        cp_avg = (_cp_safe(t_in_k) + _cp_safe(T_out_k_local)) / 2.0
+        return m_dot_mass * cp_avg * max(T_out_k_local - t_in_k, 0.0)
+
+    # Maximum thermal power the fluid can carry before reaching fluid Tmax.
+    t_high = t_max - 1e-6
+    power_cap = _power_to_fluid(t_high)
+
+    # Curtail power if irradiance would require temperatures beyond fluid validity range.
+    power_target = min(power, power_cap)
+
+    # Solve for outlet temperature using bisection on [t_in, t_high].
+    t_low = t_in_k
+    t_out_k = t_low
+    if power_target > 0:
+        for _ in range(80):
+            t_mid = 0.5 * (t_low + t_high)
+            p_mid = _power_to_fluid(t_mid)
+            if abs(p_mid - power_target) <= max(1e-3, 1e-6 * power_target):
+                t_out_k = t_mid
+                break
+            if p_mid < power_target:
+                t_low = t_mid
+            else:
+                t_high = t_mid
+            t_out_k = 0.5 * (t_low + t_high)
+
+    actual_power = _power_to_fluid(t_out_k)
+    return {"power_W": float(actual_power), "t_out_C": float(t_out_k - 273.15)}
 """
 # Example usage
 if __name__ == "__main__":

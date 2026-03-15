@@ -35,17 +35,29 @@ def plot_simulation_results(csv_path: Optional[str] = None, out_pdf: Optional[st
     else:
         energy_MWh = pd.Series(np.nan, index=df.index)
 
-    # Try to compute SOC if possible using CTES capacity from model helpers
-    try:
-        from features.ctes_1d_jian import init_ctes_state, stored_energy_J, T_max
-        cap_J = stored_energy_J(init_ctes_state(T_init=float(T_max)))
-        soc = (df['ctes_energy_J'].astype(float) / cap_J).clip(0, 1)
-    except Exception:
-        # fallback: if ctes_energy_J column is present but capacity unknown, leave NaN
-        if 'ctes_energy_J' in df.columns:
-            soc = pd.Series(np.nan, index=df.index)
-        else:
-            soc = pd.Series(np.nan, index=df.index)
+    # Prefer SOC exported by simulation; fallback to model-capacity-based estimate.
+    if 'ctes_soc_pct' in df.columns:
+        soc = (df['ctes_soc_pct'].astype(float) / 100.0).clip(0, 1)
+    else:
+        try:
+            try:
+                from ..features.ctes_1d_jian import init_ctes_state, stored_energy_J, T_max
+            except Exception:
+                from features.ctes_1d_jian import init_ctes_state, stored_energy_J, T_max
+            cap_J = stored_energy_J(init_ctes_state(T_init=float(T_max)))
+            soc = (df['ctes_energy_J'].astype(float) / cap_J).clip(0, 1)
+        except Exception:
+            # final fallback: normalize to the run's energy span if possible
+            if 'ctes_energy_J' in df.columns and df['ctes_energy_J'].astype(float).notna().any():
+                e = df['ctes_energy_J'].astype(float)
+                e_min = float(e.min(skipna=True))
+                e_max = float(e.max(skipna=True))
+                if e_max > e_min:
+                    soc = ((e - e_min) / (e_max - e_min)).clip(0, 1)
+                else:
+                    soc = pd.Series(np.nan, index=df.index)
+            else:
+                soc = pd.Series(np.nan, index=df.index)
 
     # Outlet temperature if present
     if 'ctes_temp_C' in df.columns:
