@@ -271,6 +271,7 @@ def simulate(
 	cum_ctes_charge_input_J = 0.0
 	cum_ctes_discharge_output_J = 0.0
 	cum_backup_heater_J = 0.0
+	cum_tolerated_deficit_J = 0.0
 	# CTES loss tracker (J)
 	cum_ctes_loss_J = 0.0
 	# water-side parameters for the factory HEX (given in the project)
@@ -291,6 +292,8 @@ def simulate(
 	factory_water_fallback_C = 133.0
 	# Keep this at 0.021 m3/s (not 0.21): 10x higher flow can over-discharge CTES.
 	target_hex_htf_flow_m3s = 0.021
+	# Collector split budget (HEX + CTES charge) per timestep.
+	collector_split_budget_m3s = target_hex_htf_flow_m3s
 	# Hard physical cap for collector-side volumetric flow.
 	collector_flow_hard_cap_m3s = 0.02
 	ctes_min_discharge_temp_C = initial_htf_inlet_temp_C
@@ -317,6 +320,8 @@ def simulate(
 		ctes_state_advanced = False
 		requested_ctes_to_factory_W = 0.0
 		m_ctes_charge_use_m3s = 0.0
+		res = None  # compatibility for static analyzers with stale flow inference
+		res_step = None
 		# compute minute-of-hour for gating debug prints/prompts
 		if isinstance(ts, pd.Timestamp):
 			minute_of_hour = int(ts.minute)
@@ -346,6 +351,7 @@ def simulate(
 		prev_ctes_energy_J = float(ctes_energy_J)
 		# per-timestep diagnostics defaults
 		actual_charge_W = 0.0
+		actual_charge_display_W = 0.0
 		provided_from_ctes_W = 0.0
 		solar_curtailed_W = 0.0
 		solar_power_effective_W = 0.0
@@ -461,14 +467,16 @@ def simulate(
 
 		# target feed to HEX
 		m_req = target_hex_htf_flow_m3s if factory_active else 0.0
-		# provisional target for mixing control: use primary target when collector can
-		# naturally reach it; otherwise use fallback target before calling CTES.
-		if factory_active and (m_col_avail > 0) and (not np.isnan(T_col)) and (T_col >= target_hex_htf_temp_C):
+		# provisional target for mixing control.
+		# In CTES-only mode (no collector stream), keep primary target (182 C).
+		if not factory_active:
 			T_req = target_hex_htf_temp_C
-		elif factory_active:
-			T_req = target_hex_htf_temp_fallback_C
+		elif (m_col_avail <= 1e-9) or np.isnan(T_col):
+			T_req = target_hex_htf_temp_C
+		elif T_col >= target_hex_htf_temp_C:
+			T_req = target_hex_htf_temp_C
 		else:
-			T_req = target_hex_htf_temp_C
+			T_req = target_hex_htf_temp_fallback_C
 
 		# start by using as much collector flow as reasonable up to m_req
 		m_col_use = min(m_col_avail, m_req)
@@ -604,7 +612,9 @@ def simulate(
 		solar_fraction = (m_col_use / max(m_oil_hex, 1e-12)) if m_oil_hex > 0 else 0.0
 		solar_contribution_W = provided_W * solar_fraction
 		ctes_contribution_W = provided_W * (1.0 - solar_fraction)
-		requested_ctes_to_factory_W = ctes_contribution_W
+		# Request CTES against unmet factory demand (after solar contribution), not only
+		# against preliminary HEX split. This avoids small artificial backup slices.
+		requested_ctes_to_factory_W = max(0.0, factory_load_W - solar_contribution_W)
 		ctes_loss_allowance_W = 0.0
 		if heat_loss_W is not None and ctes_y is not None:
 			try:
@@ -619,46 +629,83 @@ def simulate(
 			T_return_to_ctes_C = oil_out_C if not np.isnan(oil_out_C) else htf_in_temp_C
 			# Available hydraulic discharge mass flow based on allocated volume flow.
 			m_ctes_mass_hydraulic = m_ctes_use * rho_htf if m_ctes_use > 0 else 0.0
-			# Thermal-duty cap: do not extract more CTES heat than requested by HEX split.
-			deltaT_ctes_drive = max(1e-6, T_ctes - T_return_to_ctes_C)
-			m_ctes_mass_thermal = max(0.0, requested_ctes_to_factory_W / max(cp_htf * deltaT_ctes_drive, 1e-9))
-			m_ctes_mass = min(m_ctes_mass_hydraulic, m_ctes_mass_thermal)
+			# Let the CTES model determine extractable power; size mass flow against
+			# target energy directly, bounded only by hydraulic availability.
+			m_ctes_mass = m_ctes_mass_hydraulic
 			m_ctes_use = m_ctes_mass / max(rho_htf, 1e-9)
 
 			if m_ctes_mass > 0:
 				prev_E = ctes_energy_J
 				y_before_discharge = ctes_y
+				discharge_step_final = None
+				provided_from_ctes_instant_W = 0.0
 				allowed_drop_J = max(0.0, (requested_ctes_to_factory_W + ctes_loss_allowance_W) * float(timestep_seconds))
 				if allowed_drop_J <= 0.0:
 					m_ctes_mass = 0.0
 					m_ctes_use = 0.0
 					ctes_contribution_W = 0.0
 					ctes_to_factory_W = 0.0
+					provided_from_ctes_instant_W = 0.0
 				else:
-					m_trial = m_ctes_mass
-					res = None
-					for _ in range(4):
-						ctes_y = y_before_discharge
-						res = step_ctes(ctes_y, T_return_to_ctes_C, m_trial, 'discharging', timestep_seconds)
-						trial_drop_J = max(0.0, prev_E - float(res['energy_J']))
-						if trial_drop_J <= 1.02 * allowed_drop_J:
-							break
-						scale = float(np.clip(allowed_drop_J / max(trial_drop_J, 1e-9), 0.01, 1.0))
-						m_trial = m_trial * scale
-					if res is not None:
-						m_ctes_mass = m_trial
+					target_drop_J = max(0.0, requested_ctes_to_factory_W * float(timestep_seconds))
+					m_upper = m_ctes_mass
+					ctes_y = y_before_discharge
+					discharge_step_upper = step_ctes(ctes_y, T_return_to_ctes_C, m_upper, 'discharging', timestep_seconds)
+					drop_upper_J = max(0.0, prev_E - float(discharge_step_upper['energy_J']))
+					selected_discharge_step = None
+
+					# If even max hydraulic flow cannot reach target, use max available.
+					if drop_upper_J <= target_drop_J:
+						m_ctes_mass = m_upper
 						m_ctes_use = m_ctes_mass / max(rho_htf, 1e-9)
+						selected_discharge_step = discharge_step_upper
+					else:
+						# Bisection for mass flow that matches target drop while remaining
+						# under allowed drop (requested + ambient loss allowance).
+						m_low = 0.0
+						m_high = m_upper
+						best_m = 0.0
+						discharge_step_best = None
+						for _ in range(12):
+							m_try = 0.5 * (m_low + m_high)
+							ctes_y = y_before_discharge
+							discharge_step_try = step_ctes(ctes_y, T_return_to_ctes_C, m_try, 'discharging', timestep_seconds)
+							drop_try_J = max(0.0, prev_E - float(discharge_step_try['energy_J']))
+							if drop_try_J > allowed_drop_J:
+								m_high = m_try
+								continue
+							if drop_try_J >= target_drop_J:
+								best_m = m_try
+								m_high = m_try
+							else:
+								m_low = m_try
+						# fallback: highest feasible under allowed drop
+						if best_m <= 0.0:
+							best_m = m_low
+						ctes_y = y_before_discharge
+						discharge_step_best = step_ctes(ctes_y, T_return_to_ctes_C, best_m, 'discharging', timestep_seconds)
+						m_ctes_mass = best_m
+						m_ctes_use = m_ctes_mass / max(rho_htf, 1e-9)
+						selected_discharge_step = discharge_step_best
+
+					if selected_discharge_step is not None:
 						ctes_state_advanced = True
-						ctes_y = res['y']
-						ctes_energy_J = res['energy_J']
-				provided_from_ctes_instant_W = max(0.0, (prev_E - ctes_energy_J) / max(1.0, timestep_seconds))
+						ctes_y = selected_discharge_step['y']
+						ctes_energy_J = selected_discharge_step['energy_J']
+						discharge_step_final = selected_discharge_step
+					provided_from_ctes_instant_W = max(0.0, (prev_E - ctes_energy_J) / max(1.0, timestep_seconds))
 				# record the actual contribution (may differ from requested)
 				ctes_contribution_W = min(provided_from_ctes_instant_W, requested_ctes_to_factory_W, factory_load_W)
 				ctes_to_factory_W = ctes_contribution_W
-				ctes_flow_dir = 'to_hex'
-				last_ctes_mdot = m_ctes_mass
-				last_ctes_T_in = T_return_to_ctes_C
-				last_ctes_T_out = res.get('T_out_C', np.nan)
+				if m_ctes_mass > 0 and ctes_contribution_W > 0:
+					ctes_flow_dir = 'to_hex'
+					last_ctes_mdot = m_ctes_mass
+					last_ctes_T_in = T_return_to_ctes_C
+					last_ctes_T_out = (discharge_step_final.get('T_out_C', np.nan) if discharge_step_final is not None else np.nan)
+				else:
+					last_ctes_mdot = 0.0
+					last_ctes_T_in = np.nan
+					last_ctes_T_out = np.nan
 			else:
 				ctes_contribution_W = 0.0
 				ctes_to_factory_W = 0.0
@@ -688,7 +735,14 @@ def simulate(
 				water_out_C = factory_water_in_C + provided_W / (m_dot_w_dbg * cp_w_dbg)
 
 		# factory deficit after HEX is met by backup heater (CTES discharge was already handled in HEX split)
-		factory_deficit_W = max(0.0, factory_load_W - provided_W)
+		# Apply a small numerical tolerance so solver residue does not trigger false D*.
+		raw_factory_deficit_W = max(0.0, factory_load_W - provided_W)
+		if factory_active:
+			deficit_tolerance_W = max(1e3, 1e-3 * factory_load_W)  # 1 kW or 0.1%
+			factory_deficit_W = 0.0 if raw_factory_deficit_W <= deficit_tolerance_W else raw_factory_deficit_W
+		else:
+			factory_deficit_W = 0.0
+		tolerated_deficit_W = max(0.0, raw_factory_deficit_W - factory_deficit_W)
 		backup_heater_W = factory_deficit_W
 		provided_from_ctes_W = ctes_to_factory_W
 
@@ -696,7 +750,11 @@ def simulate(
 		if remaining_solar_W > 0:
 			if step_ctes is not None:
 				# charging flow is explicitly tracked for debug/reporting
-				m_ctes_charge_avail = max(0.0, m_col_avail)
+				# Use only collector flow not already allocated to HEX, and enforce
+				# the global collector split budget (hex + charge <= 0.021 m3/s).
+				collector_left_for_charge = max(0.0, m_col_avail - m_col_use)
+				split_budget_left = max(0.0, collector_split_budget_m3s - m_col_use)
+				m_ctes_charge_avail = min(collector_left_for_charge, split_budget_left)
 				if not disable_flow_rate_limits and max_ctes_flow_m3s is not None:
 					m_ctes_charge_avail = min(m_ctes_charge_avail, float(max_ctes_flow_m3s))
 				m_ctes_charge_use_m3s = float(m_ctes_charge_avail)
@@ -704,18 +762,18 @@ def simulate(
 				prev_E = ctes_energy_J
 				if m_ctes_charge_mass > 0:
 					T_in_for_ctes = collector_t_out_C if not np.isnan(collector_t_out_C) else htf_in_temp_C
-					res = step_ctes(ctes_y, T_in_for_ctes, m_ctes_charge_mass, 'charging', timestep_seconds)
+					res_step = step_ctes(ctes_y, T_in_for_ctes, m_ctes_charge_mass, 'charging', timestep_seconds)
 					ctes_state_advanced = True
 				else:
 					T_in_for_ctes = None
-					res = step_ctes(ctes_y, None, 0.0, 'storage', timestep_seconds)
+					res_step = step_ctes(ctes_y, None, 0.0, 'storage', timestep_seconds)
 					ctes_state_advanced = True
-				ctes_y = res['y']
-				ctes_energy_J = res['energy_J']
+				ctes_y = res_step['y']
+				ctes_energy_J = res_step['energy_J']
 				# heat exchanged with CTES from the HTF (W)
 				last_ctes_mdot = m_ctes_charge_mass
 				last_ctes_T_in = T_in_for_ctes if T_in_for_ctes is not None else np.nan
-				last_ctes_T_out = res.get('T_out_C', np.nan)
+				last_ctes_T_out = res_step.get('T_out_C', np.nan)
 				dt_local = max(1.0, float(timestep_seconds))
 				# Use net storage-energy increase as accepted charging power.
 				actual_charge_W = max(0.0, (ctes_energy_J - prev_E) / dt_local)
@@ -770,9 +828,9 @@ def simulate(
 		# Always advance CTES in storage mode when no charge/discharge step occurred,
 		# so ambient losses are present from the beginning.
 		if step_ctes is not None and not ctes_state_advanced:
-			res = step_ctes(ctes_y, None, 0.0, 'storage', timestep_seconds)
-			ctes_y = res['y']
-			ctes_energy_J = res['energy_J']
+			res_step = step_ctes(ctes_y, None, 0.0, 'storage', timestep_seconds)
+			ctes_y = res_step['y']
+			ctes_energy_J = res_step['energy_J']
 			last_ctes_mdot = 0.0
 			last_ctes_T_in = np.nan
 			last_ctes_T_out = np.nan
@@ -821,6 +879,7 @@ def simulate(
 		cum_ctes_charge_input_J += float(Q_in_to_ctes_W) * dt
 		cum_ctes_discharge_output_J += float(Q_out_from_ctes_W) * dt
 		cum_backup_heater_J += float(backup_heater_W) * dt
+		cum_tolerated_deficit_J += float(tolerated_deficit_W) * dt
 
 		# debug printing per-timestep: show key values after allocation
 		if debug:
@@ -834,6 +893,7 @@ def simulate(
 				print('DEBUG NOTE: CTES stored energy is reported relative to T_min; negative means average concrete temperature < T_min')
 				print(f'DEBUG NOTE: factory_nominal_load is computed from water side with CoolProp: {factory_nominal_load_W/1e6:.3f} MW at 120->140 C, 0.023 m3/s, 8 bar')
 				print(f'DEBUG NOTE: collector flow hard cap enforced at {collector_flow_hard_cap_m3s:.3f} m3/s; excess solar is curtailed and outlet temperature is capped')
+				print(f'DEBUG NOTE: collector split budget enforced: collector_hex + collector_chg <= {collector_split_budget_m3s:.3f} m3/s')
 				first_debug_print = False
 			# only emit per-timestep debug lines during the first 10 minutes of each hour
 			if minute_of_hour < 10:
@@ -870,7 +930,8 @@ def simulate(
 				except Exception:
 					ctes_soc_now = np.nan
 				# kW formatting
-				solar_kW = solar_power_W / 1000.0
+				solar_raw_kW = solar_power_available_W / 1000.0
+				solar_abs_kW = solar_power_W / 1000.0
 				provided_kW = provided_W / 1000.0
 				ctes_kW = provided_from_ctes_W / 1000.0
 				backup_kW = backup_heater_W / 1000.0
@@ -928,7 +989,7 @@ def simulate(
 				charging_kw_display = (actual_charge_display_W/1000.0) if 'actual_charge_display_W' in locals() else (actual_charge_W/1000.0)
 				_print_row(ts_table, 'POWER_KW', [
 					_cell_num('factory_load', factory_load_kW, decimals=2),
-					_cell_num('solar_raw', solar_kW, decimals=2),
+					_cell_num('solar_raw', solar_raw_kW, decimals=2),
 					_cell_num('solar_eff', solar_power_effective_W/1000.0, decimals=2),
 					_cell_num('solar_curt', solar_curtailed_W/1000.0, decimals=2),
 					_cell_num('hex_to_fact', provided_kW, decimals=2),
@@ -937,10 +998,10 @@ def simulate(
 					_cell_num('ctes_loss', current_loss_power_W/1000.0, decimals=3),
 				])
 				_print_row(ts_table, 'CURTAIL', [
+					_cell_num('solar_abs', solar_abs_kW, decimals=2),
 					_cell_num('coll_curt', collector_curtailment_W/1000.0, decimals=2),
 					_cell_num('tot_curt', solar_curtailed_W/1000.0, decimals=2),
 					_cell_num('mix_tgt', T_req, decimals=1),
-					_cell_txt('---', ''),
 					_cell_txt('---', ''),
 					_cell_txt('---', ''),
 					_cell_txt('---', ''),
@@ -994,7 +1055,7 @@ def simulate(
 					_cell_num('solar_curt', cum_solar_curtailed_J/3.6e9, decimals=3),
 					_cell_num('solar_sup', cum_solar_supplied_to_factory_J/3.6e9, decimals=3),
 					_cell_num('ctes_sup', cum_ctes_supplied_to_factory_J/3.6e9, decimals=3),
-					_cell_txt('---', ''),
+					_cell_num('tol_err', cum_tolerated_deficit_J/3.6e9, decimals=6),
 					_cell_txt('---', ''),
 				])
 		# prepare CTES temperature for CSV (NaN when no CTES flow)
@@ -1014,9 +1075,11 @@ def simulate(
 				"timestamp": ts,
 				"dni_W_m2": float(dni_value) if not pd.isna(dni_value) else 0.0,
 				"solar_power_W": solar_power_W,
+				"solar_power_raw_W": solar_power_available_W,
 				"solar_power_effective_W": solar_power_effective_W,
 				"solar_power_curtailed_W": solar_curtailed_W,
-				"solar_power_kW": solar_power_W / 1000.0,
+				"solar_power_kW": solar_power_available_W / 1000.0,
+				"solar_power_absorbed_kW": solar_power_W / 1000.0,
 				"solar_power_available_W": solar_power_available_W,
 				"m_col_vol_flow_m3s": m_col_vol_flow_m3s,
 				"m_col_use_m3s": m_col_use,
@@ -1052,6 +1115,8 @@ def simulate(
 				"provided_from_ctes_kW": provided_from_ctes_W/1000.0,
 				"backup_heater_W": backup_heater_W,
 				"backup_heater_kW": backup_heater_W/1000.0,
+				"tolerated_deficit_W": tolerated_deficit_W,
+				"tolerated_deficit_cumulative_MWh": cum_tolerated_deficit_J/3.6e9,
 				"ctes_loss_cumulative_MWh": cum_ctes_loss_J/3.6e9,
 				"ctes_current_loss_kW": current_loss_power_W/1000.0,
 				"ctes_charge_input_W": Q_in_to_ctes_W,
@@ -1082,6 +1147,7 @@ def simulate(
 			'total_solar_supplied_to_factory_MWh': cum_solar_supplied_to_factory_J / 3.6e9,
 			'total_ctes_supplied_to_factory_MWh': cum_ctes_supplied_to_factory_J / 3.6e9,
 			'total_backup_heater_MWh': cum_backup_heater_J / 3.6e9,
+			'total_tolerated_deficit_MWh': cum_tolerated_deficit_J / 3.6e9,
 			'total_ctes_loss_MWh': cum_ctes_loss_J / 3.6e9,
 			'total_ctes_charge_input_MWh': cum_ctes_charge_input_J / 3.6e9,
 			'total_ctes_discharge_output_MWh': cum_ctes_discharge_output_J / 3.6e9,
