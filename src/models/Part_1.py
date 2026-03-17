@@ -32,6 +32,14 @@ except Exception:
 	except Exception:
 		init_ctes_state = step_ctes = stored_energy_J = T_outlet = extract_profiles = heat_loss_W = None
 
+try:
+	from ..data.constants import n_modules as ctes_series_modules
+except Exception:
+	try:
+		from data.constants import n_modules as ctes_series_modules
+	except Exception:
+		ctes_series_modules = 14
+
 # %% Helper functions for the simulation loop
 # Load DNI input from various formats (scalar, Series, or CSV path)
 def _load_dni_input(dni_input: Union[str, float, int, pd.Series]) -> Union[float, pd.Series]:
@@ -322,6 +330,7 @@ def simulate(
 		m_ctes_charge_use_m3s = 0.0
 		actual_charge_W = 0.0
 		actual_charge_display_W = 0.0
+		ctes_model_diag = None
 		res = None  # compatibility for static analyzers with stale flow inference
 		res_step = None
 		# compute minute-of-hour for gating debug prints/prompts
@@ -727,7 +736,7 @@ def simulate(
 					target_drop_J = max(0.0, requested_ctes_to_factory_W * float(timestep_seconds))
 					m_upper = m_ctes_mass
 					ctes_y = y_before_discharge
-					discharge_step_upper = step_ctes(ctes_y, T_return_to_ctes_C, m_upper, 'discharging', timestep_seconds)
+					discharge_step_upper = step_ctes(ctes_y, T_return_to_ctes_C, (m_upper / max(1, int(ctes_series_modules))), 'discharging', timestep_seconds)
 					drop_upper_J = max(0.0, prev_E - float(discharge_step_upper['energy_J']))
 					selected_discharge_step = None
 
@@ -746,7 +755,7 @@ def simulate(
 						for _ in range(12):
 							m_try = 0.5 * (m_low + m_high)
 							ctes_y = y_before_discharge
-							discharge_step_try = step_ctes(ctes_y, T_return_to_ctes_C, m_try, 'discharging', timestep_seconds)
+							discharge_step_try = step_ctes(ctes_y, T_return_to_ctes_C, (m_try / max(1, int(ctes_series_modules))), 'discharging', timestep_seconds)
 							drop_try_J = max(0.0, prev_E - float(discharge_step_try['energy_J']))
 							if drop_try_J > allowed_drop_J:
 								m_high = m_try
@@ -760,7 +769,7 @@ def simulate(
 						if best_m <= 0.0:
 							best_m = m_low
 						ctes_y = y_before_discharge
-						discharge_step_best = step_ctes(ctes_y, T_return_to_ctes_C, best_m, 'discharging', timestep_seconds)
+						discharge_step_best = step_ctes(ctes_y, T_return_to_ctes_C, (best_m / max(1, int(ctes_series_modules))), 'discharging', timestep_seconds)
 						m_ctes_mass = best_m
 						m_ctes_use = m_ctes_mass / max(rho_htf, 1e-9)
 						selected_discharge_step = discharge_step_best
@@ -770,6 +779,7 @@ def simulate(
 						ctes_y = selected_discharge_step['y']
 						ctes_energy_J = selected_discharge_step['energy_J']
 						discharge_step_final = selected_discharge_step
+						ctes_model_diag = selected_discharge_step
 					provided_from_ctes_instant_W = max(0.0, (prev_E - ctes_energy_J) / max(1.0, timestep_seconds))
 				# record the actual contribution (may differ from requested)
 				ctes_contribution_W = min(provided_from_ctes_instant_W, requested_ctes_to_factory_W, factory_load_W)
@@ -890,12 +900,14 @@ def simulate(
 				prev_E = ctes_energy_J
 				if m_ctes_charge_mass > 0:
 					T_in_for_ctes = collector_t_out_C if not np.isnan(collector_t_out_C) else htf_in_temp_C
-					res_step = step_ctes(ctes_y, T_in_for_ctes, m_ctes_charge_mass, 'charging', timestep_seconds)
+					res_step = step_ctes(ctes_y, T_in_for_ctes, (m_ctes_charge_mass / max(1, int(ctes_series_modules))), 'charging', timestep_seconds)
 					ctes_state_advanced = True
+					ctes_model_diag = res_step
 				else:
 					T_in_for_ctes = None
 					res_step = step_ctes(ctes_y, None, 0.0, 'storage', timestep_seconds)
 					ctes_state_advanced = True
+					ctes_model_diag = res_step
 				ctes_y = res_step['y']
 				ctes_energy_J = res_step['energy_J']
 				# heat exchanged with CTES from the HTF (W)
@@ -906,7 +918,12 @@ def simulate(
 				# Charging input should represent heat transferred from HTF to CTES,
 				# not net storage rise (which can be negative when losses dominate).
 				actual_charge_W = 0.0
-				if m_ctes_charge_mass > 0 and (T_in_for_ctes is not None) and (not np.isnan(last_ctes_T_out)):
+				if isinstance(res_step, dict) and ('diag_q_to_solid_corr_W' in res_step):
+					# Net thermal power to solid storage; subtracts transient fluid inventory effects.
+					actual_charge_W = max(0.0, float(res_step.get('diag_q_to_solid_corr_W', 0.0)))
+				elif isinstance(res_step, dict) and ('diag_q_fluid_to_solid_total_W' in res_step):
+					actual_charge_W = max(0.0, float(res_step.get('diag_q_fluid_to_solid_total_W', 0.0)))
+				elif m_ctes_charge_mass > 0 and (T_in_for_ctes is not None) and (not np.isnan(last_ctes_T_out)):
 					try:
 						cp_charge = PropsSI("C", "T", ((T_in_for_ctes + last_ctes_T_out) / 2.0) + 273.15, "Q", 0, fluid)
 					except Exception:
@@ -967,6 +984,7 @@ def simulate(
 			res_step = step_ctes(ctes_y, None, 0.0, 'storage', timestep_seconds)
 			ctes_y = res_step['y']
 			ctes_energy_J = res_step['energy_J']
+			ctes_model_diag = res_step
 			last_ctes_mdot = 0.0
 			last_ctes_T_in = np.nan
 			last_ctes_T_out = np.nan
@@ -975,10 +993,16 @@ def simulate(
 		# Update HTF return temperature for next timestep from the active loop return.
 		# This prevents collector inlet from remaining fixed at the initial value.
 		htf_in_next_C = htf_in_temp_C
+		ret_num = 0.0
+		ret_den = 0.0
 		if m_oil_hex > 1e-9 and not np.isnan(oil_out_C):
-			htf_in_next_C = float(oil_out_C)
-		elif m_ctes_charge_use_m3s > 1e-9 and not np.isnan(last_ctes_T_out):
-			htf_in_next_C = float(last_ctes_T_out)
+			ret_num += float(m_oil_hex) * float(oil_out_C)
+			ret_den += float(m_oil_hex)
+		if m_ctes_charge_use_m3s > 1e-9 and not np.isnan(last_ctes_T_out):
+			ret_num += float(m_ctes_charge_use_m3s) * float(last_ctes_T_out)
+			ret_den += float(m_ctes_charge_use_m3s)
+		if ret_den > 0.0:
+			htf_in_next_C = ret_num / ret_den
 		# only commit finite values
 		if np.isfinite(htf_in_next_C):
 			htf_in_temp_C = htf_in_next_C
@@ -990,16 +1014,19 @@ def simulate(
 		dt = float(timestep_seconds)
 		# energy change in storage over this timestep
 		ctes_energy_change_J = float(ctes_energy_J) - float(prev_ctes_energy_J)
-		# Q_in and Q_out are still tracked for round-trip metrics.
-		Q_in_to_ctes_W = max(0.0, actual_charge_display_W)
+		dE_dt_W = ctes_energy_change_J / max(1.0, dt)
+		# Report CTES power channels directly from modeled charge/discharge exchange.
 		Q_out_from_ctes_W = max(0.0, ctes_to_factory_W)
+		Q_in_htf_W = max(0.0, actual_charge_W)
 		# CTES loss reporting is based on direct thermal loss to ambient from the model state.
 		if heat_loss_W is not None and ctes_y is not None:
 			current_loss_power_W = min(0.0, -float(heat_loss_W(ctes_y)))
 		else:
 			# fallback when detailed model helper is unavailable
-			loss_J = ctes_energy_change_J - (Q_in_to_ctes_W - Q_out_from_ctes_W) * dt
+			loss_J = ctes_energy_change_J - (Q_in_htf_W - Q_out_from_ctes_W) * dt
 			current_loss_power_W = (loss_J / dt) if loss_J < 0 else 0.0
+		Q_in_inferred_W = max(0.0, dE_dt_W + Q_out_from_ctes_W - current_loss_power_W)
+		Q_in_to_ctes_W = max(Q_in_htf_W, Q_in_inferred_W)
 		cum_ctes_loss_J += float(current_loss_power_W) * dt
 		ctes_delta_MWh_step = ctes_energy_change_J / 3.6e9
 		ctes_discharge_MWh_step = (Q_out_from_ctes_W * dt) / 3.6e9
@@ -1036,8 +1063,8 @@ def simulate(
 				print(f'DEBUG NOTE: collector flow hard cap enforced at {collector_flow_hard_cap_m3s:.3f} m3/s; excess solar is curtailed and outlet temperature is capped')
 				print(f'DEBUG NOTE: collector split budget enforced: collector_hex + collector_chg <= {collector_split_budget_m3s:.3f} m3/s')
 				first_debug_print = False
-			# only emit per-timestep debug lines during the first 10 minutes of each hour
-			if minute_of_hour < 10:
+			# emit per-timestep debug lines every 10 minutes
+			if (minute_of_hour % 10) == 0:
 				def _cell_num(label, val, decimals=2, label_w=15, value_w=9):
 					if pd.isna(val):
 						sval = 'nan'
@@ -1190,6 +1217,67 @@ def simulate(
 					_cell_num('bal_loss_kW', ctes_balance_residual_with_loss_W/1000.0, decimals=3),
 					_cell_txt('---', ''),
 				])
+				q_in_gap_W = float(Q_in_inferred_W - Q_in_htf_W)
+				q_in_gap_pct = (100.0 * q_in_gap_W / max(1.0, float(Q_in_to_ctes_W)))
+				closure_with_loss_kW = (-ctes_balance_residual_with_loss_W) / 1000.0
+				close_kW_display = closure_with_loss_kW
+				storage_delta_run_MWh = (float(ctes_energy_J) - float(initial_ctes_energy_J)) / 3.6e9
+				gap_flag = 'OK'
+				if abs(q_in_gap_pct) > 50.0:
+					gap_flag = 'QIN_GAP!'
+				elif abs(q_in_gap_pct) > 20.0:
+					gap_flag = 'QIN_GAP'
+				bal_flag = 'OK'
+				bal_metric_W = abs(ctes_balance_residual_with_loss_W)
+				bal_scale_W = max(1e3, float(abs(Q_in_to_ctes_W) + abs(Q_out_from_ctes_W) + abs(current_loss_power_W)))
+				if isinstance(ctes_model_diag, dict) and ('diag_closure_combined_W' in ctes_model_diag):
+					bal_metric_W = abs(float(ctes_model_diag.get('diag_closure_combined_W', 0.0)))
+					close_kW_display = (-float(ctes_model_diag.get('diag_closure_combined_W', 0.0))) / 1000.0
+				bal_rel = bal_metric_W / bal_scale_W
+				if (bal_metric_W > 5e4) or (bal_rel > 0.20):
+					bal_flag = 'BAL!'
+				elif (bal_metric_W > 1e4) or (bal_rel > 0.05):
+					bal_flag = 'BAL'
+				_print_row(ts_table, 'CTES_PWR', [
+					_cell_num('Qin_htf_kW', Q_in_htf_W/1000.0, decimals=3),
+					_cell_num('Qin_inf_kW', Q_in_inferred_W/1000.0, decimals=3),
+					_cell_num('Qin_use_kW', Q_in_to_ctes_W/1000.0, decimals=3),
+					_cell_num('Qout_kW', Q_out_from_ctes_W/1000.0, decimals=3),
+					_cell_num('Qloss_kW', current_loss_power_W/1000.0, decimals=3),
+					_cell_num('dE_kW', dE_dt_W/1000.0, decimals=3),
+					_cell_num('Qin_gap_kW', q_in_gap_W/1000.0, decimals=3),
+				])
+				_print_row(ts_table, 'CTES_CHK', [
+					_cell_num('Qin_gap_pct', q_in_gap_pct, decimals=1),
+					_cell_num('bal_rel_pct', bal_rel*100.0, decimals=1),
+					_cell_num('close_kW', close_kW_display, decimals=3),
+					_cell_num('hex_flow_bal', hex_flow_balance_m3s, decimals=5),
+					_cell_num('run_dE_MWh', storage_delta_run_MWh, decimals=3),
+					_cell_txt('gap_flag', gap_flag),
+					_cell_txt('bal_flag', bal_flag),
+					_cell_txt('---', ''),
+				])
+				if isinstance(ctes_model_diag, dict):
+					qf2s_mod_kW = float(ctes_model_diag.get('diag_q_fluid_to_solid_module_W', np.nan)) / 1000.0
+					qf2s_tot_kW = float(ctes_model_diag.get('diag_q_fluid_to_solid_total_W', np.nan)) / 1000.0
+					q_to_solid_corr_kW = float(ctes_model_diag.get('diag_q_to_solid_corr_W', np.nan)) / 1000.0
+					qloss_model_kW = float(ctes_model_diag.get('diag_q_loss_avg_W', np.nan)) / 1000.0
+					dE_model_kW = float(ctes_model_diag.get('diag_dE_W', np.nan)) / 1000.0
+					dE_fluid_model_kW = float(ctes_model_diag.get('diag_dE_fluid_W', np.nan)) / 1000.0
+					close_model_kW = float(ctes_model_diag.get('diag_closure_combined_W', np.nan)) / 1000.0
+					qf_gap_kW = q_to_solid_corr_kW - (Q_in_htf_W / 1000.0)
+					_print_row(ts_table, 'CTES_MOD', [
+						_cell_num('qf2s_mod', qf2s_mod_kW, decimals=3),
+						_cell_num('qf2s_tot', qf2s_tot_kW, decimals=3),
+						_cell_num('q2solid', q_to_solid_corr_kW, decimals=3),
+						_cell_num('dEfl_kW', dE_fluid_model_kW, decimals=3),
+						_cell_num('dE_kW', dE_model_kW, decimals=3),
+						_cell_num('qloss_kW', qloss_model_kW, decimals=3),
+						_cell_num('close_kW', close_model_kW, decimals=3),
+						_cell_num('qf_gap_kW', qf_gap_kW, decimals=3),
+						_cell_txt('mode', ctes_flow_dir),
+						_cell_txt('---', ''),
+					])
 				_print_row(ts_table, 'CUM_MWH', [
 					_cell_num('factory', cum_factory_consumed_J/3.6e9, decimals=3),
 					_cell_num('solar_eff', cum_solar_produced_J/3.6e9, decimals=3),
@@ -1197,6 +1285,15 @@ def simulate(
 					_cell_num('solar_sup', cum_solar_supplied_to_factory_J/3.6e9, decimals=3),
 					_cell_num('ctes_sup', cum_ctes_supplied_to_factory_J/3.6e9, decimals=3),
 					_cell_num('tol_err', cum_tolerated_deficit_J/3.6e9, decimals=6),
+					_cell_txt('---', ''),
+				])
+				_print_row(ts_table, 'CUM_CTES', [
+					_cell_num('Qin_MWh', cum_ctes_charge_input_J/3.6e9, decimals=3),
+					_cell_num('Qout_MWh', cum_ctes_discharge_output_J/3.6e9, decimals=3),
+					_cell_num('Qloss_MWh', (-cum_ctes_loss_J)/3.6e9, decimals=3),
+					_cell_num('dE_run_MWh', storage_delta_run_MWh, decimals=3),
+					_cell_num('R_dch_chg', (cum_ctes_discharge_output_J / max(1.0, cum_ctes_charge_input_J)), decimals=3),
+					_cell_txt('flags', f"{gap_flag}/{bal_flag}"),
 					_cell_txt('---', ''),
 				])
 		# prepare CTES temperature for CSV (NaN when no CTES flow)
@@ -1230,6 +1327,8 @@ def simulate(
 				"m_recirc_m3s": m_recirc,
 				"m_oil_hex_m3s": m_oil_hex,
 				"htf_in_temp_C": htf_in_temp_C,
+				"hex_inlet_temp_C": T_mix,
+				"mix_target_C": T_req,
 				"collector_t_out_C": collector_t_out_C,
 				"oil_out_C": oil_out_C,
 				"water_out_C": water_out_C,
@@ -1249,6 +1348,7 @@ def simulate(
 				"ctes_energy_J": ctes_energy_J,
 				"ctes_energy_MWh": ctes_energy_J / 3.6e9,
 				"ctes_soc_pct": (100.0 * (stored_energy_J(ctes_y) / max(1.0, ctes_capacity_J)) if (ctes_y is not None and stored_energy_J is not None) else np.nan),
+				"ctes_inlet_temp_C": (float(last_ctes_T_in) if ('last_ctes_T_in' in locals() and not np.isnan(last_ctes_T_in)) else np.nan),
 				"ctes_temp_C": ctes_temp_csv,
 					"concrete_T_z0_C": (extract_profiles(ctes_y)[1][0] if (ctes_y is not None and extract_profiles is not None) else np.nan),
 					"concrete_T_z_mid_C": (lambda y: (extract_profiles(y)[1][len(extract_profiles(y)[1])//2]) if (y is not None and extract_profiles is not None) else np.nan)(ctes_y),
@@ -1261,6 +1361,8 @@ def simulate(
 				"tolerated_deficit_cumulative_MWh": cum_tolerated_deficit_J/3.6e9,
 				"ctes_loss_cumulative_MWh": cum_ctes_loss_J/3.6e9,
 				"ctes_current_loss_kW": current_loss_power_W/1000.0,
+				"ctes_charge_htf_W": Q_in_htf_W,
+				"ctes_charge_inferred_W": Q_in_inferred_W,
 				"ctes_charge_input_W": Q_in_to_ctes_W,
 				"ctes_discharge_output_W": Q_out_from_ctes_W,
 				"ctes_balance_residual_state_W": ctes_balance_residual_state_W,
@@ -1303,15 +1405,14 @@ def simulate(
 			'ctes_storage_delta_MWh': ((ctes_energy_end_J - ctes_energy_start_J) / 3.6e9) if (np.isfinite(ctes_energy_start_J) and np.isfinite(ctes_energy_end_J)) else np.nan,
 		}
 		summary['ctes_discharge_to_charge_ratio_window'] = (cum_ctes_discharge_output_J / cum_ctes_charge_input_J) if cum_ctes_charge_input_J > 0 else np.nan
-		# User-requested weekly round-trip metric:
-		# (discharged - energy_start) / (charged - energy_end)
-		rte_num_J = np.nan
-		rte_den_J = np.nan
-		if np.isfinite(ctes_energy_start_J) and np.isfinite(ctes_energy_end_J):
-			rte_num_J = float(cum_ctes_discharge_output_J) - float(ctes_energy_start_J)
-			rte_den_J = float(cum_ctes_charge_input_J) - float(ctes_energy_end_J)
-		summary['ctes_round_trip_efficiency'] = (rte_num_J / rte_den_J) if (np.isfinite(rte_num_J) and np.isfinite(rte_den_J) and abs(rte_den_J) > 1e-9) else np.nan
-		summary['ctes_round_trip_efficiency_note'] = 'formula_(Qout-Estart)/(Qin-Eend)'
+		# Window efficiency can exceed 1.0 if storage starts with high inventory.
+		# Include inventory draw from storage delta to avoid misleading "free energy" RTE.
+		delta_storage_J = (ctes_energy_end_J - ctes_energy_start_J) if (np.isfinite(ctes_energy_start_J) and np.isfinite(ctes_energy_end_J)) else np.nan
+		inventory_draw_J = max(0.0, -float(delta_storage_J)) if np.isfinite(delta_storage_J) else np.nan
+		rte_input_soc_adjusted_J = (cum_ctes_charge_input_J + inventory_draw_J) if np.isfinite(inventory_draw_J) else np.nan
+		rte_ratio = (cum_ctes_discharge_output_J / rte_input_soc_adjusted_J) if (np.isfinite(rte_input_soc_adjusted_J) and rte_input_soc_adjusted_J > 0) else np.nan
+		summary['ctes_round_trip_efficiency'] = (max(0.0, float(rte_ratio)) if np.isfinite(rte_ratio) else np.nan)
+		summary['ctes_inventory_draw_MWh'] = (inventory_draw_J / 3.6e9) if np.isfinite(inventory_draw_J) else np.nan
 		# CTES first-law closure diagnostic over the simulated window:
 		# state-only: dE = Qin - Qout
 		# loss-inclusive: dE = Qin - Qout + Qloss_signed, where Qloss_signed is negative for losses.
@@ -1332,6 +1433,49 @@ def simulate(
 		summary_path = os.path.join(out_dir, f'simulation_summary_{ts}.csv')
 		summary_df.to_csv(summary_path, index=False, sep=';', decimal=',')
 		print(f"Simulation summary saved: {summary_path}")
+
+		# Also export a publication-ready LaTeX summary table.
+		def _fmt_val(v, pct=False):
+			if v is None or (isinstance(v, float) and not np.isfinite(v)):
+				return '--'
+			val = float(v)
+			if pct:
+				return f"{100.0 * val:.2f}"
+			return f"{val:.3f}"
+
+		latex_rows = [
+			('Factory Heat Demand', summary.get('total_factory_consumed_MWh'), '[MWh]', False),
+			('Solar Thermal Production', summary.get('total_solar_produced_MWh'), '[MWh]', False),
+			('Solar Curtailment', summary.get('total_solar_curtailed_MWh'), '[MWh]', False),
+			('Solar to Factory (Direct)', summary.get('total_solar_supplied_to_factory_MWh'), '[MWh]', False),
+			('CTES to Factory', summary.get('total_ctes_supplied_to_factory_MWh'), '[MWh]', False),
+			('Backup Heater Energy', summary.get('total_backup_heater_MWh'), '[MWh]', False),
+			('Solar Fraction (Direct + CTES)', summary.get('solar_fraction'), '[%]', True),
+			('CTES Charge Input', summary.get('total_ctes_charge_input_MWh'), '[MWh]', False),
+			('CTES Discharge Output', summary.get('total_ctes_discharge_output_MWh'), '[MWh]', False),
+			('CTES Round-Trip Efficiency (SOC-adjusted)', summary.get('ctes_round_trip_efficiency'), '[%]', True),
+			('CTES Stored Energy at Start', summary.get('ctes_energy_start_MWh'), '[MWh]', False),
+			('CTES Stored Energy at End', summary.get('ctes_energy_end_MWh'), '[MWh]', False),
+			('CTES Storage Delta', summary.get('ctes_storage_delta_MWh'), '[MWh]', False),
+			('CTES Thermal Loss (Absolute)', summary.get('total_ctes_loss_abs_MWh'), '[MWh]', False),
+			('Tolerated Deficit Energy', summary.get('total_tolerated_deficit_MWh'), '[MWh]', False),
+		]
+
+		latex_lines = [
+			'\\renewcommand{\\arraystretch}{1.2}',
+			'\\begin{tabular}{l r c}',
+			'\\hline',
+			'Quantity & Value & Unit \\\\',
+			'\\hline',
+		]
+		for name, val, unit, is_pct in latex_rows:
+			latex_lines.append(f"{name} & {_fmt_val(val, pct=is_pct)} & {unit} \\\\")
+		latex_lines.extend(['\\hline', '\\end{tabular}', ''])
+
+		latex_path = os.path.join(out_dir, f'simulation_summary_table_{ts}.tex')
+		with open(latex_path, 'w', encoding='utf-8') as f_ltx:
+			f_ltx.write('\n'.join(latex_lines))
+		print(f"Simulation LaTeX table saved: {latex_path}")
 	except Exception:
 		# best-effort: ignore if cannot write
 		out_path = None

@@ -1,18 +1,22 @@
-import pandas as pd
-import matplotlib.pyplot as plt
-import numpy as np
-import os
-from typing import Optional
 import glob
+import os
 import re
 from datetime import datetime
+from typing import Optional
 
-# default data directory
+import matplotlib.dates as mdates
+import matplotlib.pyplot as plt
+from matplotlib.ticker import FuncFormatter
+import numpy as np
+import pandas as pd
+
 DATA_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'data'))
+
+FONT_SIZE = 10.5
+FIG_WIDTH_A4 = 8.27
 
 
 def _find_latest_sim_csv(data_dir=DATA_DIR):
-    # Search recursively because simulation outputs are saved in timestamp folders.
     pattern = os.path.join(data_dir, '**', 'simulation_results_*.csv')
     files = glob.glob(pattern, recursive=True)
     if not files:
@@ -21,158 +25,284 @@ def _find_latest_sim_csv(data_dir=DATA_DIR):
     return files[0]
 
 
+def _timestamp_from_path(path: str) -> str:
+    m = re.search(r'(\d{8}_\d{6})', os.path.basename(path))
+    if m:
+        return m.group(1)
+    return datetime.now().strftime('%Y%m%d_%H%M%S')
+
+
+def _series(df: pd.DataFrame, col: str, scale: float = 1.0, default: float = np.nan) -> pd.Series:
+    if col in df.columns:
+        return df[col].astype(float) * scale
+    return pd.Series(default, index=df.index, dtype=float)
+
+
+def _apply_plot_style():
+    plt.rcParams.update({
+        'font.size': FONT_SIZE,
+        'axes.labelsize': FONT_SIZE,
+        'xtick.labelsize': FONT_SIZE,
+        'ytick.labelsize': FONT_SIZE,
+        'legend.fontsize': FONT_SIZE,
+    })
+
+
+def _week_window(idx: pd.Index):
+    idx = pd.DatetimeIndex(idx)
+    if len(idx) == 0:
+        return None, None
+    saturday_points = idx[idx.weekday == 5]
+    x0 = saturday_points[0] if len(saturday_points) > 0 else idx[0]
+    x1 = min(x0 + pd.Timedelta(days=7) - pd.Timedelta(minutes=10), idx[-1])
+    if x1 <= x0:
+        x0, x1 = idx[0], idx[-1]
+    return x0, x1
+
+
+def _weekday_label(x, _pos):
+    return mdates.num2date(x).strftime('%A')
+
+
+def _format_time_axis(ax, x0, x1):
+    ax.set_xlim(x0, x1)
+    ax.margins(x=0)
+    ax.xaxis.set_major_locator(mdates.DayLocator())
+    ax.xaxis.set_major_formatter(FuncFormatter(_weekday_label))
+
+
+def _legend_below(ax, ncol=3):
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.10), ncol=ncol, frameon=True)
+
+
+def _align_soc_axes(ax_soc, ax_energy, e_ctes_MWh: pd.Series):
+    """Align SoC (%) and energy (MWh) twin y-axes on the same vertical scale."""
+    soc_ticks = np.arange(0.0, 101.0, 20.0)
+    ax_soc.set_ylim(0.0, 100.0)
+    ax_soc.set_yticks(soc_ticks)
+
+    if e_ctes_MWh.notna().any():
+        e_min = float(e_ctes_MWh.min(skipna=True))
+        e_max = float(e_ctes_MWh.max(skipna=True))
+        if np.isfinite(e_min) and np.isfinite(e_max):
+            if abs(e_max - e_min) < 1e-12:
+                e_max = e_min + 1.0
+            ax_energy.set_ylim(e_min, e_max)
+            e_ticks = e_min + (soc_ticks / 100.0) * (e_max - e_min)
+            ax_energy.set_yticks(e_ticks)
+
+
 def plot_simulation_results(csv_path: Optional[str] = None, out_pdf: Optional[str] = None):
-    # auto-detect latest CSV when not provided
     if csv_path is None:
         csv_path = _find_latest_sim_csv()
         if csv_path is None:
             raise FileNotFoundError(f'No simulation CSV found in {DATA_DIR}')
 
+    _apply_plot_style()
+
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+    ts = _timestamp_from_path(csv_path)
+    out_dir = os.path.dirname(csv_path)
+    x0, x1 = _week_window(df.index)
 
-    # Energy: Joules -> MWh
-    if 'ctes_energy_J' in df.columns:
-        energy_MWh = df['ctes_energy_J'].astype(float) / 3.6e9
-    else:
-        energy_MWh = pd.Series(np.nan, index=df.index)
+    # Core solar power channels [kW]
+    p_solar_raw = _series(df, 'solar_power_raw_W', 1 / 1000.0)
+    p_solar_raw = p_solar_raw.where(p_solar_raw > 1e-6, 0.0)
+    p_solar_used = _series(df, 'solar_power_W', 1 / 1000.0)
+    p_solar_to_hex = _series(df, 'solar_contribution_W', 1 / 1000.0)
+    p_solar_to_ctes = _series(df, 'ctes_charge_input_W', 1 / 1000.0)
+    p_solar_curt = _series(df, 'solar_power_curtailed_W', 1 / 1000.0)
+    dni = _series(df, 'dni_W_m2', 1.0)
+    dni = dni.where(dni > 1e-6, 0.0)
 
-    # Prefer SOC exported by simulation; fallback to model-capacity-based estimate.
-    if 'ctes_soc_pct' in df.columns:
-        soc = (df['ctes_soc_pct'].astype(float) / 100.0).clip(0, 1)
-    else:
-        try:
-            try:
-                from ..features.ctes_1d_jian import init_ctes_state, stored_energy_J, T_max
-            except Exception:
-                from features.ctes_1d_jian import init_ctes_state, stored_energy_J, T_max
-            cap_J = stored_energy_J(init_ctes_state(T_init=float(T_max)))
-            soc = (df['ctes_energy_J'].astype(float) / cap_J).clip(0, 1)
-        except Exception:
-            # final fallback: normalize to the run's energy span if possible
-            if 'ctes_energy_J' in df.columns and df['ctes_energy_J'].astype(float).notna().any():
-                e = df['ctes_energy_J'].astype(float)
-                e_min = float(e.min(skipna=True))
-                e_max = float(e.max(skipna=True))
-                if e_max > e_min:
-                    soc = ((e - e_min) / (e_max - e_min)).clip(0, 1)
-                else:
-                    soc = pd.Series(np.nan, index=df.index)
-            else:
-                soc = pd.Series(np.nan, index=df.index)
+    # CTES thermal powers [kW] with sign convention requested by user
+    p_ctes_chg = _series(df, 'ctes_charge_input_W', 1 / 1000.0)
+    p_ctes_dis = -_series(df, 'ctes_discharge_output_W', 1 / 1000.0)
+    p_ctes_loss = _series(df, 'ctes_current_loss_kW', 1.0)
 
-    # Outlet temperature if present
-    if 'ctes_temp_C' in df.columns:
-        t_out = df['ctes_temp_C'].astype(float)
-    else:
-        t_out = pd.Series(np.nan, index=df.index)
+    soc_pct = _series(df, 'ctes_soc_pct', 1.0)
+    e_ctes_MWh = _series(df, 'ctes_energy_MWh', 1.0)
+    if e_ctes_MWh.isna().all():
+        e_ctes_MWh = _series(df, 'ctes_energy_J', 1 / 3.6e9)
 
-    # Make plots similar to the original CTES script
-    day_labels = ['Sat', 'Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri']
+    # Figure 1: three stacked panels
+    fig1, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(FIG_WIDTH_A4, 8.8), sharex=True)
 
-    # include concrete temperatures if present (z=0, z_mid, z_max)
-    has_concrete = 'concrete_T_z0_C' in df.columns
-    nplots = 4 if has_concrete else 3
-    fig, axes = plt.subplots(nplots, 1, figsize=(13, 11), sharex=True)
-    if nplots == 3:
-        axes = axes
-    else:
-        # ensure axes is indexable
-        axes = axes
+    ax1.plot(df.index, p_solar_raw, label='Potential & DNI', lw=1.3, color='black')
+    ax1.plot(df.index, p_solar_used, label='Used', lw=1.3)
+    ax1.plot(df.index, p_solar_to_hex, label='To HEX', lw=1.3)
+    ax1.plot(df.index, p_solar_to_ctes, label='To CTES', lw=1.3)
+    ax1.plot(df.index, p_solar_curt, label='Curtailment', lw=1.3, color='red')
+    ax1.set_ylabel('Collector power [kW]')
+    ax1.grid(True, alpha=0.3)
+    ax1r = ax1.twinx()
+    ax1r.plot(df.index, dni, color='black', lw=1.0, ls='-', label='_nolegend_')
+    ax1r.set_ylabel('DNI [W/m$^2$]')
+    valid_ratio = (dni > 1e-9) & np.isfinite(dni) & np.isfinite(p_solar_raw)
+    if valid_ratio.any():
+        ratio_kw_per_wm2 = float((p_solar_raw[valid_ratio] / dni[valid_ratio]).median())
+        if ratio_kw_per_wm2 > 0:
+            y0, y1 = ax1.get_ylim()
+            ax1r.set_ylim(y0 / ratio_kw_per_wm2, y1 / ratio_kw_per_wm2)
+    h1, l1 = ax1.get_legend_handles_labels()
+    ax1.legend(h1, l1, loc='upper center', bbox_to_anchor=(0.5, -0.10), ncol=3, frameon=True)
 
-    axes[0].plot(df.index, soc * 100, color='#2ecc71', lw=2)
-    axes[0].set_ylabel('SOC [%]')
-    axes[0].set_title('State of Charge')
-    axes[0].set_ylim(0, 110)
-    axes[0].grid(True, alpha=0.3)
+    ax2.plot(df.index, p_ctes_chg, label='CTES charging input', lw=1.3)
+    ax2.plot(df.index, p_ctes_dis, label='CTES discharging output', lw=1.3)
+    ax2.plot(df.index, p_ctes_loss, label='CTES thermal loss', lw=1.3)
+    ax2.set_ylabel('CTES thermal power [kW]')
+    ax2.grid(True, alpha=0.3)
+    _legend_below(ax2, ncol=2)
 
-    axes[1].plot(df.index, energy_MWh, color='#3498db', lw=2, label='1 system')
-    axes[1].set_ylabel('Stored energy [MWh]')
-    axes[1].set_title('Energy stored in concrete')
-    axes[1].grid(True, alpha=0.3)
+    ax3.plot(df.index, soc_pct, lw=1.5)
+    ax3.set_ylabel('CTES SoC [%]')
+    ax3.grid(True, alpha=0.3)
+    ax3r = ax3.twinx()
+    _align_soc_axes(ax3, ax3r, e_ctes_MWh)
+    ax3r.set_ylabel('CTES energy [MWh]')
 
-    if has_concrete:
-        concrete_z0 = df['concrete_T_z0_C'].astype(float)
-        # attempt to find mid and max concrete temps if available
-        concrete_zmid = df['concrete_T_z_mid_C'].astype(float) if 'concrete_T_z_mid_C' in df.columns else None
-        concrete_zmax = df['concrete_T_z_max_C'].astype(float) if 'concrete_T_z_max_C' in df.columns else None
-        axes[2].plot(df.index, concrete_z0, color='#9b59b6', lw=2, label='z=0')
-        if concrete_zmid is not None:
-            axes[2].plot(df.index, concrete_zmid, color='#8e44ad', lw=1.5, label='z=mid')
-        if concrete_zmax is not None:
-            axes[2].plot(df.index, concrete_zmax, color='#5e3370', lw=1.5, label='z=max')
-        axes[2].set_ylabel('Concrete T [C]')
-        axes[2].set_title('Concrete temperature (z positions)')
-        axes[2].legend()
-        axes[2].grid(True, alpha=0.3)
+    _format_time_axis(ax1, x0, x1)
+    _format_time_axis(ax2, x0, x1)
+    _format_time_axis(ax3, x0, x1)
 
-        axes[3].plot(df.index, t_out, color='#e67e22', lw=2)
-        axes[3].set_ylabel('Fluid outlet temperature [C]')
-        axes[3].set_title('Fluid outlet temperature')
-        axes[3].grid(True, alpha=0.3)
-    else:
-        axes[2].plot(df.index, t_out, color='#e67e22', lw=2)
-        axes[2].set_ylabel('Fluid outlet temperature [C]')
-        axes[2].set_title('Fluid outlet temperature')
-        axes[2].grid(True, alpha=0.3)
+    fig1.tight_layout()
+    power_pdf = out_pdf if out_pdf is not None else os.path.join(out_dir, f'thermal_power_overview_{ts}.pdf')
+    fig1.savefig(power_pdf, bbox_inches='tight')
+    print(f'Figure saved: {power_pdf}')
 
-    for ax in axes:
-        ax.xaxis.set_tick_params(rotation=20)
+    # Figure 2: stacked-area alternative + SoC panel
+    fig2, (ax21, ax22, ax23) = plt.subplots(3, 1, figsize=(FIG_WIDTH_A4, 8.2), sharex=True)
 
-    axes[-1].set_xlabel('Time')
-    plt.tight_layout()
+    ax21.stackplot(
+        df.index,
+        [p_solar_to_hex.clip(lower=0.0), p_solar_to_ctes.clip(lower=0.0), p_solar_curt.clip(lower=0.0)],
+        labels=['To HEX', 'To CTES', 'Curtailment'],
+        alpha=0.75,
+        colors=['tab:green', 'tab:purple', 'red'],
+    )
+    ax21.plot(df.index, p_solar_raw, color='black', lw=1.0, ls='-', label='Potential/DNI')
+    ax21.set_ylabel('Power [kW]')
+    ax21.grid(True, alpha=0.3)
+    ax21r = ax21.twinx()
+    ax21r.plot(df.index, dni, color='black', lw=1.0, ls='-')
+    ax21r.set_ylabel('DNI [W/m$^2$]')
+    ax21.set_ylim(bottom=0.0)
+    ax21r.set_ylim(bottom=0.0)
+    _legend_below(ax21, ncol=2)
 
-    # derive timestamp from CSV filename when possible
-    m = re.search(r'(\d{8}_\d{6})', os.path.basename(csv_path))
-    if m:
-        ts = m.group(1)
-    else:
-        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+    p_factory_solar = _series(df, 'solar_to_factory_kW', 1.0)
+    p_factory_ctes = _series(df, 'ctes_to_factory_kW', 1.0)
+    p_factory_backup = _series(df, 'backup_heater_kW', 1.0)
+    p_factory_load = _series(df, 'factory_load_kW', 1.0)
+    ax22.stackplot(
+        df.index,
+        [p_factory_solar.clip(lower=0.0), p_factory_ctes.clip(lower=0.0), p_factory_backup.clip(lower=0.0)],
+        labels=['Factory from solar', 'Factory from CTES', 'Factory from backup'],
+        alpha=0.70,
+        colors=['tab:blue', 'tab:orange', 'red'],
+    )
+    ax22.plot(df.index, p_factory_load, color='black', lw=1.0, ls='-', label='Factory thermal demand')
+    ax22.set_ylabel('Power [kW]')
+    ax22.grid(True, alpha=0.3)
+    _legend_below(ax22, ncol=2)
 
-    if out_pdf is None:
-        out_pdf = os.path.join(os.path.dirname(csv_path), f'simulation_plots_{ts}.pdf')
+    ax23.plot(df.index, soc_pct, lw=1.5)
+    ax23.set_ylabel('CTES SoC [%]')
+    ax23.grid(True, alpha=0.3)
+    ax23r = ax23.twinx()
+    _align_soc_axes(ax23, ax23r, e_ctes_MWh)
+    ax23r.set_ylabel('CTES energy [MWh]')
 
-    # save vector PDF
-    fig.savefig(out_pdf, bbox_inches='tight')
-    print(f'Plots saved: {out_pdf}')
+    _format_time_axis(ax21, x0, x1)
+    _format_time_axis(ax22, x0, x1)
+    _format_time_axis(ax23, x0, x1)
 
-    # Combined Collector + Flows figure (collector plots + flows in same figure)
-    has_collector = 'solar_power_W' in df.columns or 'collector_t_out_C' in df.columns
-    flow_cols = [c for c in ['m_col_vol_flow_m3s','m_col_use_m3s','m_ctes_use_m3s','m_oil_hex_m3s'] if c in df.columns]
-    if has_collector or flow_cols:
-        nsub = 2 + (1 if ('collector_t_out_C' in df.columns) else 0)
-        # We'll create a 3-row figure: collector power, collector temp (if present), flows
-        figC, axsC = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
-        # collector power
-        if 'solar_power_W' in df.columns:
-            axsC[0].plot(df.index, df['solar_power_W'].astype(float) / 1e3, color='#f39c12')
-            axsC[0].set_ylabel('Collector power [kW]')
-            axsC[0].grid(True, alpha=0.3)
-        else:
-            axsC[0].text(0.5, 0.5, 'No collector power data', ha='center')
+    fig2.tight_layout()
+    stacked_pdf = os.path.join(out_dir, f'thermal_power_overview_stacked_{ts}.pdf')
+    fig2.savefig(stacked_pdf, bbox_inches='tight')
+    print(f'Figure saved: {stacked_pdf}')
 
-        # collector outlet temp (if present)
-        if 'collector_t_out_C' in df.columns:
-            axsC[1].plot(df.index, df['collector_t_out_C'].astype(float), color='#1abc9c')
-            axsC[1].set_ylabel('Collector outlet T [C]')
-            axsC[1].grid(True, alpha=0.3)
-        else:
-            axsC[1].text(0.5, 0.5, 'No collector temp data', ha='center')
+    # Figure 3: HTF temperatures + concrete profile temperatures
+    fig3, (ax31, ax32) = plt.subplots(2, 1, figsize=(FIG_WIDTH_A4, 7.1), sharex=True)
 
-        # flows
-        if flow_cols:
-            for c in flow_cols:
-                axsC[2].plot(df.index, df[c].astype(float), label=c)
-            axsC[2].set_ylabel('Flow [m3/s]')
-            axsC[2].legend()
-            axsC[2].grid(True, alpha=0.3)
-        else:
-            axsC[2].text(0.5, 0.5, 'No flow data', ha='center')
+    t_return = _series(df, 'htf_in_temp_C', 1.0)
+    t_col_out = _series(df, 'collector_t_out_C', 1.0)
+    t_hex_in = _series(df, 'hex_inlet_temp_C', 1.0)
+    t_hex_out = _series(df, 'oil_out_C', 1.0)
+    t_ctes_in = _series(df, 'ctes_inlet_temp_C', 1.0)
+    t_ctes_out = _series(df, 'ctes_temp_C', 1.0)
 
-        axsC[2].set_xlabel('Time')
-        combined_pdf = os.path.join(os.path.dirname(csv_path), f'simulation_collector_and_flows_{ts}.pdf')
-        figC.tight_layout()
-        figC.savefig(combined_pdf, bbox_inches='tight')
-        print(f'Collector+Flows plots saved: {combined_pdf}')
+    ax31.plot(df.index, t_return, label='HTF return', lw=1.2, color='tab:blue')
+    ax31.plot(df.index, t_col_out, label='Collector outlet', lw=1.2, color='tab:orange')
+    ax31.plot(df.index, t_hex_in, label='HEX inlet', lw=1.3, color='tab:green')
+    ax31.plot(df.index, t_hex_out, label='HEX outlet', lw=1.2, color='tab:red', ls='--')
+    ax31.plot(df.index, t_ctes_in, label='CTES inlet', lw=1.2, color='tab:purple', ls=':')
+    ax31.plot(df.index, t_ctes_out, label='CTES outlet', lw=1.2, color='tab:brown', ls='-.')
+    ax31.set_ylabel('Temperature [C]')
+    ax31.grid(True, alpha=0.3)
+    _legend_below(ax31, ncol=3)
+
+    t_z0 = _series(df, 'concrete_T_z0_C', 1.0)
+    t_zmid = _series(df, 'concrete_T_z_mid_C', 1.0)
+    t_zmax = _series(df, 'concrete_T_z_max_C', 1.0)
+    ax32.plot(df.index, t_z0, label='z=0', lw=1.2)
+    ax32.plot(df.index, t_zmid, label='z=mid', lw=1.2)
+    ax32.plot(df.index, t_zmax, label='z=max', lw=1.2)
+    ax32.set_ylabel('$T_{CTES}$ [°C]')
+    ax32.grid(True, alpha=0.3)
+    _legend_below(ax32, ncol=3)
+
+    _format_time_axis(ax31, x0, x1)
+    _format_time_axis(ax32, x0, x1)
+
+    fig3.tight_layout()
+    temps_pdf = os.path.join(out_dir, f'htf_and_ctes_temperatures_{ts}.pdf')
+    fig3.savefig(temps_pdf, bbox_inches='tight')
+    print(f'Figure saved: {temps_pdf}')
+
+    # Figure 4: key HTF flow rates + HEX flow share fractions
+    fig4, (ax4, ax5) = plt.subplots(2, 1, figsize=(FIG_WIDTH_A4, 6.0), sharex=True)
+
+    f_col_total = _series(df, 'm_col_vol_flow_m3s', 1.0)
+    f_col_hex = _series(df, 'm_col_use_m3s', 1.0)
+    f_col_to_ctes = _series(df, 'm_ctes_charge_use_m3s', 1.0)
+    f_ctes_to_hex = _series(df, 'm_ctes_use_m3s', 1.0)
+    f_hex_to_ctes = f_ctes_to_hex.copy()
+    f_recirc = _series(df, 'm_recirc_m3s', 1.0)
+
+    ax4.plot(df.index, f_col_total, label='Collector total', lw=1.2)
+    ax4.plot(df.index, f_col_to_ctes, label='Collector to CTES', lw=1.2)
+    ax4.plot(df.index, f_ctes_to_hex, label='CTES to HEX', lw=1.2)
+    ax4.plot(df.index, f_hex_to_ctes, label='HEX to CTES return', lw=1.0, ls='--')
+    ax4.plot(df.index, f_recirc, label='HEX recirculation', lw=1.2)
+    ax4.set_ylabel('Flow [m$^3$/s]')
+    ax4.grid(True, alpha=0.3)
+    _legend_below(ax4, ncol=3)
+
+    flow_total = _series(df, 'm_oil_hex_m3s', 1.0).replace(0.0, np.nan)
+    frac_solar = 100.0 * (f_col_hex / flow_total)
+    frac_ctes = 100.0 * (f_ctes_to_hex / flow_total)
+    frac_recirc = 100.0 * (f_recirc / flow_total)
+    ax5.stackplot(
+        df.index,
+        [frac_solar.fillna(0.0), frac_ctes.fillna(0.0), frac_recirc.fillna(0.0)],
+        labels=['Solar', 'CTES', 'Recirculation'],
+        alpha=0.75,
+        colors=['tab:blue', 'tab:orange', 'tab:green'],
+    )
+    ax5.set_ylabel('HEX flow share [%]')
+    ax5.set_ylim(0, 100)
+    ax5.grid(True, alpha=0.3)
+    _legend_below(ax5, ncol=3)
+
+    _format_time_axis(ax4, x0, x1)
+    _format_time_axis(ax5, x0, x1)
+
+    fig4.tight_layout()
+    flow_pdf = os.path.join(out_dir, f'htf_flow_rates_{ts}.pdf')
+    fig4.savefig(flow_pdf, bbox_inches='tight')
+    print(f'Figure saved: {flow_pdf}')
+
 
 if __name__ == '__main__':
     latest = _find_latest_sim_csv()
