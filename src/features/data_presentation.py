@@ -12,8 +12,9 @@ DATA_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'data'
 
 
 def _find_latest_sim_csv(data_dir=DATA_DIR):
-    pattern = os.path.join(data_dir, 'simulation_results_*.csv')
-    files = glob.glob(pattern)
+    # Search recursively because simulation outputs are saved in timestamp folders.
+    pattern = os.path.join(data_dir, '**', 'simulation_results_*.csv')
+    files = glob.glob(pattern, recursive=True)
     if not files:
         return None
     files.sort(key=os.path.getmtime, reverse=True)
@@ -143,8 +144,8 @@ def plot_simulation_results(csv_path: Optional[str] = None, out_pdf: Optional[st
         figC, axsC = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
         # collector power
         if 'solar_power_W' in df.columns:
-            axsC[0].plot(df.index, df['solar_power_W'].astype(float), color='#f39c12')
-            axsC[0].set_ylabel('Collector power [W]')
+            axsC[0].plot(df.index, df['solar_power_W'].astype(float) / 1e3, color='#f39c12')
+            axsC[0].set_ylabel('Collector power [kW]')
             axsC[0].grid(True, alpha=0.3)
         else:
             axsC[0].text(0.5, 0.5, 'No collector power data', ha='center')

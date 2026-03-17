@@ -295,7 +295,7 @@ def simulate(
 	# Collector split budget (HEX + CTES charge) per timestep.
 	collector_split_budget_m3s = target_hex_htf_flow_m3s
 	# Hard physical cap for collector-side volumetric flow.
-	collector_flow_hard_cap_m3s = 0.02
+	collector_flow_hard_cap_m3s = 0.021
 	ctes_min_discharge_temp_C = initial_htf_inlet_temp_C
 	pinch_delta_C = 16.0  # minimal approach temperature between oil and water
 
@@ -320,6 +320,8 @@ def simulate(
 		ctes_state_advanced = False
 		requested_ctes_to_factory_W = 0.0
 		m_ctes_charge_use_m3s = 0.0
+		actual_charge_W = 0.0
+		actual_charge_display_W = 0.0
 		res = None  # compatibility for static analyzers with stale flow inference
 		res_step = None
 		# compute minute-of-hour for gating debug prints/prompts
@@ -487,7 +489,9 @@ def simulate(
 			# solve m_col*T_col + m_ctes*T_ctes = m_req*T_req  => m_ctes = (m_req*T_req - m_col*T_col)/(T_ctes - T_req)
 			m_ctes_needed = (m_req * T_req - m_col_use * T_col) / (T_ctes - T_req)
 		elif m_col_use == 0 and (T_ctes - T_req) != 0:
-			m_ctes_needed = m_req
+			# Do not force full 0.021 m3/s in CTES-only mode; let power-based sizing
+			# determine the required external flow and leave spare HEX capacity for recirculation.
+			m_ctes_needed = 0.0
 
 		# Also request CTES support based on power shortfall (not only temperature shortfall),
 		# so sunrise periods do not fall into collector-only backup-heavy behavior.
@@ -501,33 +505,59 @@ def simulate(
 
 		m_ctes_use = float(np.clip(m_ctes_needed, 0.0, m_ctes_discharge_avail))
 
+		# In single-source operation, trim external flow to the minimum thermal demand
+		# (with a small margin). This preserves spare HEX capacity for recirculation.
+		if factory_active and m_col_use > 1e-12 and m_ctes_use <= 1e-12 and (not np.isnan(T_col)):
+			T_out_min_req_C = factory_water_target_C + pinch_delta_C
+			dT_src = max(1e-6, T_col - T_out_min_req_C)
+			m_dot_need = factory_load_W / max(cp_htf * dT_src, 1e-9)
+			m_vol_need = m_dot_need / max(rho_htf, 1e-9)
+			m_col_use = min(m_col_use, 1.05 * max(0.0, m_vol_need))
+		if factory_active and m_ctes_use > 1e-12 and m_col_use <= 1e-12 and (not np.isnan(T_ctes)):
+			T_out_min_req_C = factory_water_target_C + pinch_delta_C
+			dT_src = max(1e-6, T_ctes - T_out_min_req_C)
+			m_dot_need = factory_load_W / max(cp_htf * dT_src, 1e-9)
+			m_vol_need = m_dot_need / max(rho_htf, 1e-9)
+			m_ctes_use = min(m_ctes_use, 1.05 * max(0.0, m_vol_need))
+
 		# if CTES unavailable or insufficient, try to supplement with collector more (if more available)
 		if m_col_use + m_ctes_use < m_req:
 			extra_from_col = min(m_col_avail - m_col_use, m_req - (m_col_use + m_ctes_use))
 			m_col_use += extra_from_col
 
-		# compute the mixed inlet temperature to HEX from currently allocated flows
-		denom = m_col_use + m_ctes_use
-		T_mix = _safe_mix_temp(m_col_use, T_col, m_ctes_use, T_ctes, htf_in_temp_C)
+		# If collector power exceeds factory demand in collector-only operation,
+		# free a small share of collector flow for simultaneous CTES charging.
+		# This avoids B-mode timesteps with curtailment but zero charging flow.
+		if (
+			factory_active
+			and m_ctes_use <= 1e-9
+			and m_col_use > 1e-9
+			and solar_power_W > max(0.0, factory_load_W)
+		):
+			surplus_frac = 1.0 - (factory_load_W / max(solar_power_W, 1e-9))
+			# Keep the reduction conservative to avoid upsetting HEX delivery.
+			reduction_frac = float(np.clip(surplus_frac, 0.0, 0.10))
+			m_col_use *= (1.0 - reduction_frac)
 
-		# compute a conservative recirculation to lower inlet if T_mix > T_req
+		# Enforce maximum HEX throughput: external (collector+CTES) plus recirculation
+		# may not exceed m_req (= 0.021 m3/s when factory is active).
+		denom_ext = m_col_use + m_ctes_use
+		if factory_active and m_req > 0 and denom_ext > m_req:
+			overflow = denom_ext - m_req
+			# Keep CTES support when needed; reduce collector first.
+			reduce_col = min(m_col_use, overflow)
+			m_col_use -= reduce_col
+			overflow -= reduce_col
+			if overflow > 0:
+				m_ctes_use = max(0.0, m_ctes_use - overflow)
+		denom_ext = m_col_use + m_ctes_use
+
+		# External-source mixed inlet to HEX before recirculation.
+		T_mix_ext = _safe_mix_temp(m_col_use, T_col, m_ctes_use, T_ctes, htf_in_temp_C)
+		T_mix = T_mix_ext
 		m_recirc = 0.0
-		if T_mix > T_req:
-			T_recirc = htf_in_temp_C
-			if T_recirc < T_mix and (T_req - T_recirc) > 0:
-				# compute internal recirculation required to hit target inlet
-				# exactly. This is internal loop flow only and does not add to
-				# external HEX feed volume (m_oil_hex).
-				m_recirc = denom * (T_mix - T_req) / (T_req - T_recirc)
-				m_recirc = float(max(0.0, m_recirc))
-				# recirculation affects the mixed inlet temperature but does not
-				# increase the external flow volume.
-				T_mix = ((denom) * T_mix + m_recirc * T_recirc) / max(1e-12, (denom + m_recirc))
-				# numeric safety: controller intent is to not exceed HEX inlet target.
-				T_mix = min(T_mix, T_req)
-
-		# final oil flow supplied to HEX (external flows only)
-		m_oil_hex = denom
+		# Total HEX flow includes recirculation and is capped by m_req.
+		m_oil_hex = (denom_ext if not factory_active else min(m_req, denom_ext))
 
 		# Control mode for this timestep:
 		# primary: target HEX inlet 182 C and water target 140 C
@@ -536,32 +566,35 @@ def simulate(
 		hex_in_target_used_C = target_hex_htf_temp_fallback_C if fallback_mode_active else target_hex_htf_temp_C
 		water_target_used_C = factory_water_fallback_C if fallback_mode_active else factory_water_target_C
 
-		# compute required oil inlet temperature to meet the factory water target given m_oil_hex
-		required_oil_in_C = np.nan
-		hex_temp_sufficient = False
-		if factory_active and m_oil_hex > 0:
-			# water-side required power to reach factory target
-			try:
-				rho_w = PropsSI("D", "T", factory_water_in_C + 273.15, "Q", 0, "Water")
-				cp_w = PropsSI("C", "T", factory_water_in_C + 273.15, "Q", 0, "Water")
-			except Exception:
-				rho_w = 1000.0; cp_w = 4180.0
-			m_w = factory_water_flow_m3s * rho_w
-			desired_W_full = m_w * cp_w * (water_target_used_C - factory_water_in_C)
+		def _compute_hex_required_inlet(T_in_C: float, oil_flow_m3s: float) -> tuple[float, bool]:
+			req_oil_in_C = np.nan
+			hex_ok = False
+			if factory_active and oil_flow_m3s > 0:
+				# water-side required power to reach factory target
+				try:
+					rho_w_loc = PropsSI("D", "T", factory_water_in_C + 273.15, "Q", 0, "Water")
+					cp_w_loc = PropsSI("C", "T", factory_water_in_C + 273.15, "Q", 0, "Water")
+				except Exception:
+					rho_w_loc = 1000.0
+					cp_w_loc = 4180.0
+				m_w_loc = factory_water_flow_m3s * rho_w_loc
+				desired_W_full_loc = m_w_loc * cp_w_loc * (water_target_used_C - factory_water_in_C)
+				# oil properties at inlet temperature guess
+				try:
+					rho_oil_loc = PropsSI("D", "T", T_in_C + 273.15, "Q", 0, "INCOMP::PNF")
+					cp_oil_loc = PropsSI("C", "T", T_in_C + 273.15, "Q", 0, "INCOMP::PNF")
+				except Exception:
+					rho_oil_loc = 870.0
+					cp_oil_loc = 2200.0
+				m_dot_oil_loc = oil_flow_m3s * rho_oil_loc
+				oil_out_min_C_loc = water_target_used_C + pinch_delta_C
+				if m_dot_oil_loc > 0 and cp_oil_loc > 0:
+					req_oil_in_C = oil_out_min_C_loc + desired_W_full_loc / (m_dot_oil_loc * cp_oil_loc)
+					hex_ok = T_in_C >= req_oil_in_C
+			return req_oil_in_C, hex_ok
 
-			# oil properties at inlet temperature guess (use T_mix for cp/rho)
-			try:
-				rho_oil = PropsSI("D", "T", T_mix + 273.15, "Q", 0, "INCOMP::PNF")
-				cp_oil = PropsSI("C", "T", T_mix + 273.15, "Q", 0, "INCOMP::PNF")
-			except Exception:
-				rho_oil = 870.0; cp_oil = 2200.0
-			m_dot_oil = m_oil_hex * rho_oil
-			# assume minimum oil outlet temperature equals water target plus pinch
-			oil_out_min_C = water_target_used_C + pinch_delta_C
-			if m_dot_oil > 0 and cp_oil > 0:
-				required_oil_in_C = oil_out_min_C + desired_W_full / (m_dot_oil * cp_oil)
-				# check if current mixed HTF inlet temperature is sufficient to reach required inlet
-				hex_temp_sufficient = T_mix >= required_oil_in_C
+		# compute required oil inlet temperature to meet the factory water target given m_oil_hex
+		required_oil_in_C, hex_temp_sufficient = _compute_hex_required_inlet(T_mix, m_oil_hex)
 
 		# compute water-side desired power for factory if active
 		desired_water_power_W = 0.0
@@ -586,6 +619,43 @@ def simulate(
 				pinch_delta=pinch_delta_C,
 		)
 
+		# Recirculation iteration: use spare HEX flow capacity (m_req - external flow)
+		# and maximize recirculation toward T_req without cooling below target.
+		if factory_active and m_req > 0 and denom_ext > 1e-12:
+			m_recirc_cap = max(0.0, m_req - denom_ext)
+			if m_recirc_cap > 1e-12:
+				for _ in range(4):
+					if np.isnan(oil_out_C):
+						break
+					T_recirc_ref = float(oil_out_C)
+					# Recirculation helps whenever return is cooler than external supply.
+					if T_mix <= T_req + 1e-9:
+						break
+					if T_recirc_ref >= T_mix_ext - 1e-9:
+						break
+					if T_recirc_ref < T_req - 1e-9:
+						# enough cooling potential exists to possibly hit target
+						m_need = denom_ext * (T_mix_ext - T_req) / max(1e-12, (T_req - T_recirc_ref))
+						m_recirc_new = float(np.clip(m_need, 0.0, m_recirc_cap))
+					else:
+						# return is still above target: use all available spare flow for best-effort cooling
+						m_recirc_new = float(m_recirc_cap)
+					if abs(m_recirc_new - m_recirc) < 1e-10:
+						break
+					m_recirc = m_recirc_new
+					m_oil_hex = denom_ext + m_recirc
+					T_mix = ((denom_ext * T_mix_ext) + (m_recirc * T_recirc_ref)) / max(1e-12, m_oil_hex)
+					required_oil_in_C, hex_temp_sufficient = _compute_hex_required_inlet(T_mix, m_oil_hex)
+					oil_out_C, provided_W, water_out_C = oil_water_hex(
+						oil_in_C=T_mix,
+						oil_flow_m3s=m_oil_hex,
+						desired_water_power_W=desired_water_power_W if factory_active else 0.0,
+						water_vol_flow_m3s=(factory_water_flow_m3s if factory_active else None),
+						water_in_C=factory_water_in_C,
+						water_target_C=(water_target_used_C if factory_active else None),
+						pinch_delta=pinch_delta_C,
+					)
+
 		# If HEX couldn't meet the full demand and a backup heater would be needed,
 		# allow a relaxed pinch (10 C) and re-evaluate to see if that reduces backup heater use.
 		if factory_active and (not fallback_mode_active):
@@ -607,9 +677,16 @@ def simulate(
 					oil_out_C = oil_out_C_relaxed
 					water_out_C = water_out_C_relaxed
 
+		# Report HEX sufficiency based on the final achieved duty, not only the
+		# earlier inlet-temperature heuristic. This keeps STATUS consistent when a
+		# relaxed pinch solve still meets factory duty.
+		if factory_active:
+			hex_power_tol_W = max(1e3, 1e-3 * factory_load_W)
+			hex_temp_sufficient = bool(provided_W >= max(0.0, desired_water_power_W - hex_power_tol_W))
+
 		# account for provided_W as energy used from HTF (charging/discharging logic follows)
-		# solar contribution to provided_W is proportional to fraction of oil coming from collector
-		solar_fraction = (m_col_use / max(m_oil_hex, 1e-12)) if m_oil_hex > 0 else 0.0
+		# Split source contribution by external source flows only; recirculation is internal.
+		solar_fraction = (m_col_use / max(denom_ext, 1e-12)) if denom_ext > 0 else 0.0
 		solar_contribution_W = provided_W * solar_fraction
 		ctes_contribution_W = provided_W * (1.0 - solar_fraction)
 		# Request CTES against unmet factory demand (after solar contribution), not only
@@ -716,6 +793,53 @@ def simulate(
 				ctes_to_factory_W = ctes_contribution_W
 				ctes_flow_dir = 'to_hex'
 
+		# Reconcile HEX mixing/recirculation after possible CTES discharge-flow correction.
+		# During discharge sizing, m_ctes_use can change; refresh recirc with final external flows.
+		if factory_active and m_req > 0:
+			denom_ext_post = max(0.0, m_col_use + m_ctes_use)
+			if denom_ext_post > m_req:
+				overflow_post = denom_ext_post - m_req
+				reduce_col_post = min(m_col_use, overflow_post)
+				m_col_use -= reduce_col_post
+				overflow_post -= reduce_col_post
+				if overflow_post > 0:
+					m_ctes_use = max(0.0, m_ctes_use - overflow_post)
+				denom_ext_post = max(0.0, m_col_use + m_ctes_use)
+
+			T_mix_ext_post = _safe_mix_temp(m_col_use, T_col, m_ctes_use, T_ctes, htf_in_temp_C)
+			m_recirc_cap_post = max(0.0, m_req - denom_ext_post)
+			m_recirc_post = 0.0
+			T_mix_post = T_mix_ext_post
+			if m_recirc_cap_post > 1e-12 and not np.isnan(oil_out_C):
+				T_recirc_post = float(oil_out_C)
+				if (T_mix_ext_post > T_req + 1e-9) and (T_recirc_post < T_mix_ext_post - 1e-9):
+					if T_recirc_post < T_req - 1e-9:
+						m_need_post = denom_ext_post * (T_mix_ext_post - T_req) / max(1e-12, (T_req - T_recirc_post))
+						m_recirc_post = float(np.clip(m_need_post, 0.0, m_recirc_cap_post))
+					else:
+						m_recirc_post = float(m_recirc_cap_post)
+					m_oil_hex_post = denom_ext_post + m_recirc_post
+					T_mix_post = ((denom_ext_post * T_mix_ext_post) + (m_recirc_post * T_recirc_post)) / max(1e-12, m_oil_hex_post)
+				else:
+					m_oil_hex_post = denom_ext_post
+			else:
+				m_oil_hex_post = denom_ext_post
+
+			if (abs(m_recirc_post - m_recirc) > 1e-10) or (abs(T_mix_post - T_mix) > 1e-9) or (abs(m_oil_hex_post - m_oil_hex) > 1e-10):
+				m_recirc = m_recirc_post
+				m_oil_hex = m_oil_hex_post
+				T_mix = T_mix_post
+				required_oil_in_C, hex_temp_sufficient = _compute_hex_required_inlet(T_mix, m_oil_hex)
+				oil_out_C, provided_W, water_out_C = oil_water_hex(
+					oil_in_C=T_mix,
+					oil_flow_m3s=m_oil_hex,
+					desired_water_power_W=desired_water_power_W if factory_active else 0.0,
+					water_vol_flow_m3s=(factory_water_flow_m3s if factory_active else None),
+					water_in_C=factory_water_in_C,
+					water_target_C=(water_target_used_C if factory_active else None),
+					pinch_delta=pinch_delta_C,
+				)
+
 		# remaining solar energy after HEX provisioning is available for charging CTES or exported
 		remaining_solar_W = max(0.0, solar_power_W - solar_contribution_W)
 
@@ -740,8 +864,12 @@ def simulate(
 		if factory_active:
 			deficit_tolerance_W = max(1e3, 1e-3 * factory_load_W)  # 1 kW or 0.1%
 			factory_deficit_W = 0.0 if raw_factory_deficit_W <= deficit_tolerance_W else raw_factory_deficit_W
+			# Final HEX sufficiency flag should match delivered factory duty after
+			# all control corrections and deficit tolerance handling.
+			hex_temp_sufficient = bool(factory_deficit_W <= deficit_tolerance_W)
 		else:
 			factory_deficit_W = 0.0
+			hex_temp_sufficient = True
 		tolerated_deficit_W = max(0.0, raw_factory_deficit_W - factory_deficit_W)
 		backup_heater_W = factory_deficit_W
 		provided_from_ctes_W = ctes_to_factory_W
@@ -775,8 +903,16 @@ def simulate(
 				last_ctes_T_in = T_in_for_ctes if T_in_for_ctes is not None else np.nan
 				last_ctes_T_out = res_step.get('T_out_C', np.nan)
 				dt_local = max(1.0, float(timestep_seconds))
-				# Use net storage-energy increase as accepted charging power.
-				actual_charge_W = max(0.0, (ctes_energy_J - prev_E) / dt_local)
+				# Charging input should represent heat transferred from HTF to CTES,
+				# not net storage rise (which can be negative when losses dominate).
+				actual_charge_W = 0.0
+				if m_ctes_charge_mass > 0 and (T_in_for_ctes is not None) and (not np.isnan(last_ctes_T_out)):
+					try:
+						cp_charge = PropsSI("C", "T", ((T_in_for_ctes + last_ctes_T_out) / 2.0) + 273.15, "Q", 0, fluid)
+					except Exception:
+						cp_charge = cp_htf
+					cp_charge = max(float(cp_charge), 1e-9)
+					actual_charge_W = max(0.0, m_ctes_charge_mass * cp_charge * max(0.0, (T_in_for_ctes - last_ctes_T_out)))
 				actual_charge_display_W = min(max(0.0, remaining_solar_W), actual_charge_W)
 				if actual_charge_W > 0 and ctes_flow_dir == 'none':
 					ctes_flow_dir = 'to_coll'
@@ -869,6 +1005,11 @@ def simulate(
 		ctes_discharge_MWh_step = (Q_out_from_ctes_W * dt) / 3.6e9
 		ctes_charge_MWh_step = (Q_in_to_ctes_W * dt) / 3.6e9
 		ctes_loss_MWh_step = (-current_loss_power_W * dt) / 3.6e9
+		# state residual: closure using only model state delta vs explicit Qin/Qout
+		ctes_balance_residual_state_W = (ctes_energy_change_J / dt) - (Q_in_to_ctes_W - Q_out_from_ctes_W)
+		# loss-inclusive residual: closure when adding separately reported ambient-loss term
+		ctes_balance_residual_with_loss_W = ctes_balance_residual_state_W - current_loss_power_W
+		hex_flow_balance_m3s = m_oil_hex - (m_col_use + m_ctes_use + m_recirc)
 
 		# accumulate energies for summary (use timestep duration)
 		cum_factory_consumed_J += float(factory_load_W) * dt
@@ -1045,8 +1186,8 @@ def simulate(
 					_cell_num('Qin_step', ctes_charge_MWh_step, decimals=4),
 					_cell_num('Qout_step', ctes_discharge_MWh_step, decimals=4),
 					_cell_num('Qloss_step', ctes_loss_MWh_step, decimals=4),
-					_cell_txt('---', ''),
-					_cell_txt('---', ''),
+					_cell_num('bal_state_kW', ctes_balance_residual_state_W/1000.0, decimals=3),
+					_cell_num('bal_loss_kW', ctes_balance_residual_with_loss_W/1000.0, decimals=3),
 					_cell_txt('---', ''),
 				])
 				_print_row(ts_table, 'CUM_MWH', [
@@ -1086,6 +1227,7 @@ def simulate(
 				"m_ctes_use_m3s": m_ctes_use,
 				"m_ctes_charge_use_m3s": m_ctes_charge_use_m3s,
 				"m_ctes_discharge_avail_m3s": m_ctes_discharge_avail,
+				"m_recirc_m3s": m_recirc,
 				"m_oil_hex_m3s": m_oil_hex,
 				"htf_in_temp_C": htf_in_temp_C,
 				"collector_t_out_C": collector_t_out_C,
@@ -1121,10 +1263,15 @@ def simulate(
 				"ctes_current_loss_kW": current_loss_power_W/1000.0,
 				"ctes_charge_input_W": Q_in_to_ctes_W,
 				"ctes_discharge_output_W": Q_out_from_ctes_W,
+				"ctes_balance_residual_state_W": ctes_balance_residual_state_W,
+				"ctes_balance_residual_with_loss_W": ctes_balance_residual_with_loss_W,
+				"hex_flow_balance_m3s": hex_flow_balance_m3s,
 			}
 		)
 
 	results_df = pd.DataFrame.from_records(records).set_index("timestamp")
+	ctes_energy_start_J = float(results_df['ctes_energy_J'].iloc[0]) if ('ctes_energy_J' in results_df.columns and len(results_df) > 0) else np.nan
+	ctes_energy_end_J = float(results_df['ctes_energy_J'].iloc[-1]) if ('ctes_energy_J' in results_df.columns and len(results_df) > 0) else np.nan
 
 	# Save results to CSV for later plotting by data_presentation
 	try:
@@ -1140,7 +1287,7 @@ def simulate(
 		print(f"Simulation CSV written: {out_path}")
 
 		# Write a one-line summary CSV with totals over the entire period (energies in MWh)
-		summary = {
+		summary: dict[str, object] = {
 			'total_factory_consumed_MWh': cum_factory_consumed_J / 3.6e9,
 			'total_solar_produced_MWh': cum_solar_produced_J / 3.6e9,
 			'total_solar_curtailed_MWh': cum_solar_curtailed_J / 3.6e9,
@@ -1151,11 +1298,36 @@ def simulate(
 			'total_ctes_loss_MWh': cum_ctes_loss_J / 3.6e9,
 			'total_ctes_charge_input_MWh': cum_ctes_charge_input_J / 3.6e9,
 			'total_ctes_discharge_output_MWh': cum_ctes_discharge_output_J / 3.6e9,
+			'ctes_energy_start_MWh': (ctes_energy_start_J / 3.6e9) if np.isfinite(ctes_energy_start_J) else np.nan,
+			'ctes_energy_end_MWh': (ctes_energy_end_J / 3.6e9) if np.isfinite(ctes_energy_end_J) else np.nan,
+			'ctes_storage_delta_MWh': ((ctes_energy_end_J - ctes_energy_start_J) / 3.6e9) if (np.isfinite(ctes_energy_start_J) and np.isfinite(ctes_energy_end_J)) else np.nan,
 		}
-		summary['ctes_round_trip_efficiency'] = (cum_ctes_discharge_output_J / cum_ctes_charge_input_J) if cum_ctes_charge_input_J > 0 else np.nan
-		# solar fraction defined as solar energy supplied to factory / total supplied to factory (solar+ctes+backup)
+		summary['ctes_discharge_to_charge_ratio_window'] = (cum_ctes_discharge_output_J / cum_ctes_charge_input_J) if cum_ctes_charge_input_J > 0 else np.nan
+		# User-requested weekly round-trip metric:
+		# (discharged - energy_start) / (charged - energy_end)
+		rte_num_J = np.nan
+		rte_den_J = np.nan
+		if np.isfinite(ctes_energy_start_J) and np.isfinite(ctes_energy_end_J):
+			rte_num_J = float(cum_ctes_discharge_output_J) - float(ctes_energy_start_J)
+			rte_den_J = float(cum_ctes_charge_input_J) - float(ctes_energy_end_J)
+		summary['ctes_round_trip_efficiency'] = (rte_num_J / rte_den_J) if (np.isfinite(rte_num_J) and np.isfinite(rte_den_J) and abs(rte_den_J) > 1e-9) else np.nan
+		summary['ctes_round_trip_efficiency_note'] = 'formula_(Qout-Estart)/(Qin-Eend)'
+		# CTES first-law closure diagnostic over the simulated window:
+		# state-only: dE = Qin - Qout
+		# loss-inclusive: dE = Qin - Qout + Qloss_signed, where Qloss_signed is negative for losses.
+		if np.isfinite(ctes_energy_start_J) and np.isfinite(ctes_energy_end_J):
+			dE_window_J = float(ctes_energy_end_J) - float(ctes_energy_start_J)
+			balance_rhs_state_J = float(cum_ctes_charge_input_J) - float(cum_ctes_discharge_output_J)
+			balance_rhs_with_loss_J = balance_rhs_state_J + float(cum_ctes_loss_J)
+			summary['ctes_energy_balance_residual_state_MWh'] = (dE_window_J - balance_rhs_state_J) / 3.6e9
+			summary['ctes_energy_balance_residual_with_loss_MWh'] = (dE_window_J - balance_rhs_with_loss_J) / 3.6e9
+		else:
+			summary['ctes_energy_balance_residual_state_MWh'] = np.nan
+			summary['ctes_energy_balance_residual_with_loss_MWh'] = np.nan
+		summary['total_ctes_loss_abs_MWh'] = (-float(cum_ctes_loss_J)) / 3.6e9
+		# Solar fraction includes direct solar + CTES-delivered energy (solar-derived).
 		total_supplied = cum_solar_supplied_to_factory_J + cum_ctes_supplied_to_factory_J + cum_backup_heater_J
-		summary['solar_fraction'] = (cum_solar_supplied_to_factory_J / total_supplied) if total_supplied > 0 else np.nan
+		summary['solar_fraction'] = ((cum_solar_supplied_to_factory_J + cum_ctes_supplied_to_factory_J) / total_supplied) if total_supplied > 0 else np.nan
 		summary_df = pd.DataFrame([summary])
 		summary_path = os.path.join(out_dir, f'simulation_summary_{ts}.csv')
 		summary_df.to_csv(summary_path, index=False, sep=';', decimal=',')
@@ -1172,7 +1344,7 @@ if __name__ == "__main__":
 	print("Call `simulate(dni_series_or_path, ...)` from your scripts or notebooks.")
 	# Quick smoke-run when invoked directly: use the provided DNI file and defaults
 	try:
-		csv_in = 'src/data/DNI_10m_3days.csv'
+		csv_in = 'src/data/DNI_10m.csv'
 		# if running in an interactive terminal, enable interactive prompts and debug
 		if sys.stdin is not None and sys.stdin.isatty():
 			results = simulate(csv_in, debug=True, interactive=True)
