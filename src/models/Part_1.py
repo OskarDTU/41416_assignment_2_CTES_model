@@ -207,6 +207,10 @@ def simulate(
 	factory_off_on_weekends: bool = True,
  	fluid: str = "INCOMP::PNF",
 	disable_flow_rate_limits: bool = True,
+	early_sun_charge_priority: bool = True,
+	early_sun_start_hour: int = 6,
+	early_sun_end_hour: int = 11,
+	early_sun_collector_overdrive_factor: float = 1.0,
  	debug: bool = False,
  	interactive: bool = False,
 ):
@@ -298,7 +302,7 @@ def simulate(
 	target_hex_htf_temp_C = 182.0
 	target_hex_htf_temp_fallback_C = 160.0
 	factory_water_fallback_C = 133.0
-	# Keep this at 0.021 m3/s (not 0.21): 10x higher flow can over-discharge CTES.
+	# Keep default design flow at 0.021 m3/s (well below 0.21 m3/s).
 	target_hex_htf_flow_m3s = 0.021
 	# Collector split budget (HEX + CTES charge) per timestep.
 	collector_split_budget_m3s = target_hex_htf_flow_m3s
@@ -336,9 +340,11 @@ def simulate(
 		# compute minute-of-hour for gating debug prints/prompts
 		if isinstance(ts, pd.Timestamp):
 			minute_of_hour = int(ts.minute)
+			hour_of_day = int(ts.hour)
 		else:
 			curr_hour = int(np.floor(elapsed_h))
 			minute_of_hour = int(((elapsed_h - curr_hour) * 60) % 60)
+			hour_of_day = int(curr_hour % 24)
 		# interactive per-hour pause when requested (only during first 10 minutes)
 		if interactive:
 			curr_hour = int(np.floor(elapsed_h))
@@ -397,8 +403,11 @@ def simulate(
 			m_col_vol_flow_m3s = m_dot_mass_needed / rho_htf
 
 		# enforce pump/collector upper bounds (can be temporarily disabled)
-		# Hard collector cap is always enforced.
-		m_col_vol_flow_m3s = min(m_col_vol_flow_m3s, collector_flow_hard_cap_m3s)
+		# Morning overdrive can relax collector hard cap to absorb more solar into CTES.
+		collector_flow_hard_cap_step_m3s = collector_flow_hard_cap_m3s
+		if early_sun_charge_priority and (early_sun_start_hour <= hour_of_day < early_sun_end_hour):
+			collector_flow_hard_cap_step_m3s = collector_flow_hard_cap_m3s * max(1.0, float(early_sun_collector_overdrive_factor))
+		m_col_vol_flow_m3s = min(m_col_vol_flow_m3s, collector_flow_hard_cap_step_m3s)
 		if not disable_flow_rate_limits:
 			if max_collector_flow_m3s is not None:
 				m_col_vol_flow_m3s = min(m_col_vol_flow_m3s, max_collector_flow_m3s)
@@ -736,7 +745,7 @@ def simulate(
 					target_drop_J = max(0.0, requested_ctes_to_factory_W * float(timestep_seconds))
 					m_upper = m_ctes_mass
 					ctes_y = y_before_discharge
-					discharge_step_upper = step_ctes(ctes_y, T_return_to_ctes_C, (m_upper / max(1, int(ctes_series_modules))), 'discharging', timestep_seconds)
+					discharge_step_upper = step_ctes(ctes_y, T_return_to_ctes_C, m_upper, 'discharging', timestep_seconds)
 					drop_upper_J = max(0.0, prev_E - float(discharge_step_upper['energy_J']))
 					selected_discharge_step = None
 
@@ -755,7 +764,7 @@ def simulate(
 						for _ in range(12):
 							m_try = 0.5 * (m_low + m_high)
 							ctes_y = y_before_discharge
-							discharge_step_try = step_ctes(ctes_y, T_return_to_ctes_C, (m_try / max(1, int(ctes_series_modules))), 'discharging', timestep_seconds)
+							discharge_step_try = step_ctes(ctes_y, T_return_to_ctes_C, m_try, 'discharging', timestep_seconds)
 							drop_try_J = max(0.0, prev_E - float(discharge_step_try['energy_J']))
 							if drop_try_J > allowed_drop_J:
 								m_high = m_try
@@ -769,7 +778,7 @@ def simulate(
 						if best_m <= 0.0:
 							best_m = m_low
 						ctes_y = y_before_discharge
-						discharge_step_best = step_ctes(ctes_y, T_return_to_ctes_C, (best_m / max(1, int(ctes_series_modules))), 'discharging', timestep_seconds)
+						discharge_step_best = step_ctes(ctes_y, T_return_to_ctes_C, best_m, 'discharging', timestep_seconds)
 						m_ctes_mass = best_m
 						m_ctes_use = m_ctes_mass / max(rho_htf, 1e-9)
 						selected_discharge_step = discharge_step_best
@@ -878,6 +887,7 @@ def simulate(
 			# all control corrections and deficit tolerance handling.
 			hex_temp_sufficient = bool(factory_deficit_W <= deficit_tolerance_W)
 		else:
+			deficit_tolerance_W = 1e3
 			factory_deficit_W = 0.0
 			hex_temp_sufficient = True
 		tolerated_deficit_W = max(0.0, raw_factory_deficit_W - factory_deficit_W)
@@ -889,10 +899,17 @@ def simulate(
 			if step_ctes is not None:
 				# charging flow is explicitly tracked for debug/reporting
 				# Use only collector flow not already allocated to HEX, and enforce
-				# the global collector split budget (hex + charge <= 0.021 m3/s).
+				# the global collector split budget (hex + charge <= target_hex_htf_flow_m3s).
 				collector_left_for_charge = max(0.0, m_col_avail - m_col_use)
 				split_budget_left = max(0.0, collector_split_budget_m3s - m_col_use)
-				m_ctes_charge_avail = min(collector_left_for_charge, split_budget_left)
+				served_factory_now = (factory_deficit_W <= deficit_tolerance_W + 1e-9)
+				in_early_sun_window = (early_sun_start_hour <= hour_of_day < early_sun_end_hour)
+				if early_sun_charge_priority and in_early_sun_window and served_factory_now:
+					# Morning priority: use any collector flow not needed by HEX to charge CTES.
+					allowed_charge_flow = collector_left_for_charge
+				else:
+					allowed_charge_flow = split_budget_left
+				m_ctes_charge_avail = min(collector_left_for_charge, allowed_charge_flow)
 				if not disable_flow_rate_limits and max_ctes_flow_m3s is not None:
 					m_ctes_charge_avail = min(m_ctes_charge_avail, float(max_ctes_flow_m3s))
 				m_ctes_charge_use_m3s = float(m_ctes_charge_avail)
@@ -900,7 +917,7 @@ def simulate(
 				prev_E = ctes_energy_J
 				if m_ctes_charge_mass > 0:
 					T_in_for_ctes = collector_t_out_C if not np.isnan(collector_t_out_C) else htf_in_temp_C
-					res_step = step_ctes(ctes_y, T_in_for_ctes, (m_ctes_charge_mass / max(1, int(ctes_series_modules))), 'charging', timestep_seconds)
+					res_step = step_ctes(ctes_y, T_in_for_ctes, m_ctes_charge_mass, 'charging', timestep_seconds)
 					ctes_state_advanced = True
 					ctes_model_diag = res_step
 				else:
@@ -1026,7 +1043,7 @@ def simulate(
 			loss_J = ctes_energy_change_J - (Q_in_htf_W - Q_out_from_ctes_W) * dt
 			current_loss_power_W = (loss_J / dt) if loss_J < 0 else 0.0
 		Q_in_inferred_W = max(0.0, dE_dt_W + Q_out_from_ctes_W - current_loss_power_W)
-		Q_in_to_ctes_W = max(Q_in_htf_W, Q_in_inferred_W)
+		Q_in_to_ctes_W = Q_in_htf_W
 		cum_ctes_loss_J += float(current_loss_power_W) * dt
 		ctes_delta_MWh_step = ctes_energy_change_J / 3.6e9
 		ctes_discharge_MWh_step = (Q_out_from_ctes_W * dt) / 3.6e9
@@ -1433,49 +1450,6 @@ def simulate(
 		summary_path = os.path.join(out_dir, f'simulation_summary_{ts}.csv')
 		summary_df.to_csv(summary_path, index=False, sep=';', decimal=',')
 		print(f"Simulation summary saved: {summary_path}")
-
-		# Also export a publication-ready LaTeX summary table.
-		def _fmt_val(v, pct=False):
-			if v is None or (isinstance(v, float) and not np.isfinite(v)):
-				return '--'
-			val = float(v)
-			if pct:
-				return f"{100.0 * val:.2f}"
-			return f"{val:.3f}"
-
-		latex_rows = [
-			('Factory Heat Demand', summary.get('total_factory_consumed_MWh'), '[MWh]', False),
-			('Solar Thermal Production', summary.get('total_solar_produced_MWh'), '[MWh]', False),
-			('Solar Curtailment', summary.get('total_solar_curtailed_MWh'), '[MWh]', False),
-			('Solar to Factory (Direct)', summary.get('total_solar_supplied_to_factory_MWh'), '[MWh]', False),
-			('CTES to Factory', summary.get('total_ctes_supplied_to_factory_MWh'), '[MWh]', False),
-			('Backup Heater Energy', summary.get('total_backup_heater_MWh'), '[MWh]', False),
-			('Solar Fraction (Direct + CTES)', summary.get('solar_fraction'), '[%]', True),
-			('CTES Charge Input', summary.get('total_ctes_charge_input_MWh'), '[MWh]', False),
-			('CTES Discharge Output', summary.get('total_ctes_discharge_output_MWh'), '[MWh]', False),
-			('CTES Round-Trip Efficiency (SOC-adjusted)', summary.get('ctes_round_trip_efficiency'), '[%]', True),
-			('CTES Stored Energy at Start', summary.get('ctes_energy_start_MWh'), '[MWh]', False),
-			('CTES Stored Energy at End', summary.get('ctes_energy_end_MWh'), '[MWh]', False),
-			('CTES Storage Delta', summary.get('ctes_storage_delta_MWh'), '[MWh]', False),
-			('CTES Thermal Loss (Absolute)', summary.get('total_ctes_loss_abs_MWh'), '[MWh]', False),
-			('Tolerated Deficit Energy', summary.get('total_tolerated_deficit_MWh'), '[MWh]', False),
-		]
-
-		latex_lines = [
-			'\\renewcommand{\\arraystretch}{1.2}',
-			'\\begin{tabular}{l r c}',
-			'\\hline',
-			'Quantity & Value & Unit \\\\',
-			'\\hline',
-		]
-		for name, val, unit, is_pct in latex_rows:
-			latex_lines.append(f"{name} & {_fmt_val(val, pct=is_pct)} & {unit} \\\\")
-		latex_lines.extend(['\\hline', '\\end{tabular}', ''])
-
-		latex_path = os.path.join(out_dir, f'simulation_summary_table_{ts}.tex')
-		with open(latex_path, 'w', encoding='utf-8') as f_ltx:
-			f_ltx.write('\n'.join(latex_lines))
-		print(f"Simulation LaTeX table saved: {latex_path}")
 	except Exception:
 		# best-effort: ignore if cannot write
 		out_path = None

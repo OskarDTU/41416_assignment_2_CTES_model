@@ -179,6 +179,7 @@ def Q_loss_module(T_s_avg, T_amb_in, vw):
 N_z    = 30                                  # number of axial nodes
 z_nodes = np.linspace(0, L_module, N_z)      # [m] axial positions
 dz      = z_nodes[1] - z_nodes[0]            # [m] axial step size
+STATE_SIZE_MODULE = 2 * N_z
 
 def ctes_1d_rhs(t, y, T_in, m_dot, mode):
     """
@@ -219,13 +220,13 @@ def ctes_1d_rhs(t, y, T_in, m_dot, mode):
 
         # ---- Fluid equation: upwind advection scheme ----
         if mode == 'charging':
-            # charging: fluid enters at z=L (cold end), flows in -z direction
-            T_f_next  = T_in if j == N_z-1 else y[2*(j+1)]
-            advection = U * (T_f_next - T_f_j) / dz
-        else:
-            # discharging: fluid enters at z=0, flows in +z direction
+            # charging: fluid enters at z=0, flows in +z direction
             T_f_prev  = T_in if j == 0 else y[2*(j-1)]
             advection = -U * (T_f_j - T_f_prev) / dz
+        else:
+            # discharging: fluid enters at z=L, flows in -z direction
+            T_f_next  = T_in if j == N_z-1 else y[2*(j+1)]
+            advection = U * (T_f_next - T_f_j) / dz
 
         dydt[2*j] = advection + coeff_f * (T_s_j - T_f_j)
 
@@ -240,16 +241,60 @@ def ctes_1d_rhs(t, y, T_in, m_dot, mode):
 # POST-PROCESSING FUNCTIONS
 # =============================================================================
 def extract_profiles(y):
-    """Extract T_f and T_s arrays from state vector."""
-    T_f = np.array([y[2*j]   for j in range(N_z)])
-    T_s = np.array([y[2*j+1] for j in range(N_z)])
-    return T_f, T_s
+    """Extract fluid/solid profiles from state vector.
+
+    For explicit series states (`len(y) = 2*N_z*n_mod`), this returns the
+    profile concatenated over modules from z=0 side to z=max side.
+    """
+    y_arr = np.asarray(y, dtype=float)
+    if y_arr.size % STATE_SIZE_MODULE != 0:
+        raise ValueError("CTES state length must be a multiple of 2*N_z")
+    n_mod_state = y_arr.size // STATE_SIZE_MODULE
+    if n_mod_state == 1:
+        T_f = np.array([y_arr[2*j] for j in range(N_z)], dtype=float)
+        T_s = np.array([y_arr[2*j+1] for j in range(N_z)], dtype=float)
+        return T_f, T_s
+
+    T_f_parts = []
+    T_s_parts = []
+    for k in range(n_mod_state):
+        yk = y_arr[k * STATE_SIZE_MODULE:(k + 1) * STATE_SIZE_MODULE]
+        T_f_parts.append(np.array([yk[2*j] for j in range(N_z)], dtype=float))
+        T_s_parts.append(np.array([yk[2*j+1] for j in range(N_z)], dtype=float))
+    return np.concatenate(T_f_parts), np.concatenate(T_s_parts)
+
+
+def _split_module_states(y):
+    y_arr = np.asarray(y, dtype=float)
+    if y_arr.size % STATE_SIZE_MODULE != 0:
+        raise ValueError("CTES state length must be a multiple of 2*N_z")
+    n_mod_state = y_arr.size // STATE_SIZE_MODULE
+    return [y_arr[k * STATE_SIZE_MODULE:(k + 1) * STATE_SIZE_MODULE].copy() for k in range(n_mod_state)]
+
+
+def _combine_module_states(states):
+    if not states:
+        return np.array([], dtype=float)
+    return np.concatenate([np.asarray(s, dtype=float) for s in states])
+
+
+def _module_energy_J(y_mod, T_ref):
+    _, T_s_mod = extract_profiles(y_mod)
+    return float(rho_con * Cp_con * S_s * n_pipes * np.trapz(T_s_mod - T_ref, z_nodes))
+
+
+def _module_fluid_energy_J(y_mod, T_ref):
+    T_f_mod, _ = extract_profiles(y_mod)
+    return float(rho_f * Cp_f * S_f * n_pipes * np.trapz(T_f_mod - T_ref, z_nodes))
+
+
+def _module_heat_loss_W(y_mod):
+    _, T_s_mod = extract_profiles(y_mod)
+    return float(np.sum([Q_loss_module(float(T_s_j), T_amb, v_wind) for T_s_j in T_s_mod]) * dz / L_module)
 
 def stored_energy(y, T_ref=T_min):
-    """Energy stored in one module [MWh]."""
-    _, T_s = extract_profiles(y)
-    E = rho_con * Cp_con * S_s * n_pipes * np.trapz(T_s - T_ref, z_nodes)
-    return E / 3.6e9
+    """Energy stored in CTES [MWh]."""
+    return stored_energy_J(y, T_ref=T_ref) / 3.6e9
 
 def SOC(y):
     """State of Charge [-]."""
@@ -259,7 +304,7 @@ def SOC(y):
 def T_outlet(y, mode):
     """Fluid outlet temperature [C]."""
     T_f, _ = extract_profiles(y)
-    return T_f[0] if mode == 'charging' else T_f[-1]
+    return float(T_f[-1] if mode == 'charging' else T_f[0])
 
 
 def heat_loss_W(y):
@@ -268,10 +313,10 @@ def heat_loss_W(y):
     This uses the same `Q_loss_module` formulation as the ODE source term and
     aggregates losses over axial nodes and modules.
     """
-    _, T_s = extract_profiles(y)
-    # Match discretization used in rhs: node-wise loss distributed over module length.
-    loss_one_module_W = float(np.sum([Q_loss_module(float(T_s_j), T_amb, v_wind) for T_s_j in T_s]) * dz / L_module)
-    return loss_one_module_W * n_modules
+    mods = _split_module_states(y)
+    if len(mods) == 1:
+        return _module_heat_loss_W(mods[0]) * n_modules
+    return float(sum(_module_heat_loss_W(m) for m in mods))
 
 
 # ---------------------------------------------------------------------------
@@ -283,7 +328,8 @@ def init_ctes_state(T_init=None):
     - `T_init` if provided sets all temperatures to that value (C). Otherwise uses `T_min`.
     """
     T0 = T_min if T_init is None else float(T_init)
-    return np.full(2 * N_z, T0)
+    y_mod = np.full(STATE_SIZE_MODULE, T0)
+    return np.tile(y_mod, n_modules)
 
 
 def stored_energy_J(y, T_ref=None):
@@ -293,18 +339,20 @@ def stored_energy_J(y, T_ref=None):
     """
     if T_ref is None:
         T_ref = T_min
-    _, T_s = extract_profiles(y)
-    E = rho_con * Cp_con * S_s * n_pipes * np.trapz(T_s - T_ref, z_nodes)
-    return float(E * n_modules)
+    mods = _split_module_states(y)
+    if len(mods) == 1:
+        return _module_energy_J(mods[0], T_ref) * n_modules
+    return float(sum(_module_energy_J(m, T_ref) for m in mods))
 
 
 def fluid_energy_J(y, T_ref=None):
     """Return HTF sensible energy (J) inside CTES volume relative to `T_ref`."""
     if T_ref is None:
         T_ref = T_min
-    T_f, _ = extract_profiles(y)
-    E = rho_f * Cp_f * S_f * n_pipes * np.trapz(T_f - T_ref, z_nodes)
-    return float(E * n_modules)
+    mods = _split_module_states(y)
+    if len(mods) == 1:
+        return _module_fluid_energy_J(mods[0], T_ref) * n_modules
+    return float(sum(_module_fluid_energy_J(m, T_ref) for m in mods))
 
 
 def step_ctes(y_curr, T_in_C, m_dot_total_kg_s, mode, dt_seconds, rtol=1e-5, atol=1e-7):
@@ -336,70 +384,63 @@ def step_ctes(y_curr, T_in_C, m_dot_total_kg_s, mode, dt_seconds, rtol=1e-5, ato
     E_prev_J = stored_energy_J(y_curr)
     E_fluid_prev_J = fluid_energy_J(y_curr)
     q_loss_prev_W = max(0.0, float(heat_loss_W(y_curr)))
-    sol = solve_ivp(
-        ctes_1d_rhs,
-        [0.0, float(dt_seconds)],
-        y_curr,
-        args=(T_in_val, m_dot_val, mode_use),
-        method='Radau',
-        rtol=rtol,
-        atol=atol,
-    )
-    y_new = sol.y[:, -1]
 
-    E_J = stored_energy_J(y_new)
-    soc = SOC(y_new)
-    T_out = T_outlet(y_new, mode_use)
-    q_loss_new_W = max(0.0, float(heat_loss_W(y_new)))
-    E_fluid_new_J = fluid_energy_J(y_new)
-    # Use solver trajectory to compute timestep-averaged powers, so closure compares
-    # integrated storage changes against integrated boundary terms.
-    if sol.t.size >= 2:
-        t_path = sol.t
-        y_path = sol.y.T
-        q_loss_path_W = np.array([max(0.0, float(heat_loss_W(y_i))) for y_i in y_path], dtype=float)
-        q_loss_avg_W = float(np.trapz(q_loss_path_W, t_path) / dt_val)
-        if mode_use in ('charging', 'discharging'):
-            q_fluid_boundary_path_W = np.array(
-                [m_dot_val * Cp_f * (T_in_val - float(T_outlet(y_i, mode_use))) * float(n_modules) for y_i in y_path],
-                dtype=float,
+    mods_prev = _split_module_states(y_curr)
+    n_mod_state = len(mods_prev)
+    mods_new = [m.copy() for m in mods_prev]
+
+    if mode_use == 'storage' or m_dot_val <= 0.0:
+        for k in range(n_mod_state):
+            sol_k = solve_ivp(
+                ctes_1d_rhs,
+                [0.0, float(dt_seconds)],
+                mods_prev[k],
+                args=(T_in_val, 0.0, 'storage'),
+                method='Radau',
+                rtol=rtol,
+                atol=atol,
             )
-            q_fluid_to_solid_total_W = float(np.trapz(q_fluid_boundary_path_W, t_path) / dt_val)
-        else:
-            q_fluid_to_solid_total_W = 0.0
+            mods_new[k] = sol_k.y[:, -1]
+        T_out = T_outlet(_combine_module_states(mods_new), 'discharging')
+        q_fluid_to_solid_total_W = 0.0
     else:
-        q_loss_avg_W = 0.5 * (q_loss_prev_W + q_loss_new_W)
-        if mode_use in ('charging', 'discharging'):
-            q_fluid_to_solid_total_W = m_dot_val * Cp_f * (T_in_val - float(T_out)) * float(n_modules)
+        # Physical ordering: module 0 at z=0 side, module n-1 at z=max side.
+        if mode_use == 'charging':
+            order = range(0, n_mod_state)
         else:
-            q_fluid_to_solid_total_W = 0.0
-    q_fluid_to_solid_module_W = q_fluid_to_solid_total_W / float(n_modules)
+            order = range(n_mod_state - 1, -1, -1)
+
+        T_in_chain = T_in_val
+        for k in order:
+            sol_k = solve_ivp(
+                ctes_1d_rhs,
+                [0.0, float(dt_seconds)],
+                mods_prev[k],
+                args=(T_in_chain, m_dot_val, mode_use),
+                method='Radau',
+                rtol=rtol,
+                atol=atol,
+            )
+            mods_new[k] = sol_k.y[:, -1]
+            T_in_chain = T_outlet(mods_new[k], mode_use)
+        T_out = float(T_in_chain)
+        q_fluid_to_solid_total_W = m_dot_val * Cp_f * (T_in_val - T_out)
+
+    y_new = _combine_module_states(mods_new)
+    E_J = stored_energy_J(y_new)
+    E_fluid_new_J = fluid_energy_J(y_new)
+    soc = SOC(y_new)
+    q_loss_new_W = max(0.0, float(heat_loss_W(y_new)))
+    q_loss_avg_W = 0.5 * (q_loss_prev_W + q_loss_new_W)
+    q_fluid_to_solid_module_W = q_fluid_to_solid_total_W / max(1, n_mod_state)
     dE_W_fd = (float(E_J) - float(E_prev_J)) / dt_val
     dE_fluid_W_fd = (float(E_fluid_new_J) - float(E_fluid_prev_J)) / dt_val
-    # Build power diagnostics from the ODE RHS along the integration path so
-    # closure uses the same semi-discrete balance as the solver.
-    if sol.t.size >= 2:
-        t_path = sol.t
-        y_path = sol.y.T
-        dE_solid_rhs_path_W = []
-        dE_fluid_rhs_path_W = []
-        solid_factor = rho_con * Cp_con * S_s * float(n_pipes) * float(n_modules) * dz
-        fluid_factor = rho_f * Cp_f * S_f * float(n_pipes) * float(n_modules) * dz
-        for t_i, y_i in zip(t_path, y_path):
-            rhs_i = ctes_1d_rhs(float(t_i), y_i, T_in_val, m_dot_val, mode_use)
-            dE_fluid_rhs_path_W.append(float(fluid_factor * np.sum(rhs_i[0::2])))
-            dE_solid_rhs_path_W.append(float(solid_factor * np.sum(rhs_i[1::2])))
-        dE_W_rhs = float(np.trapz(np.array(dE_solid_rhs_path_W, dtype=float), t_path) / dt_val)
-        dE_fluid_W_rhs = float(np.trapz(np.array(dE_fluid_rhs_path_W, dtype=float), t_path) / dt_val)
-    else:
-        dE_W_rhs = dE_W_fd
-        dE_fluid_W_rhs = dE_fluid_W_fd
+    dE_W_rhs = dE_W_fd
+    dE_fluid_W_rhs = dE_fluid_W_fd
 
-    # Robust net charge into concrete from solid-side first law.
+    # Net power to solid and diagnostic closures.
     q_to_solid_corr_W = dE_W_fd + q_loss_avg_W
-    # Fluid-vs-solid transfer mismatch diagnostic.
     closure_solid_corr_W = (q_fluid_to_solid_total_W - dE_fluid_W_fd) - q_to_solid_corr_W
-    # First-law closure for combined (solid+fluid) CTES control volume.
     closure_combined_W = (dE_W_rhs + dE_fluid_W_rhs) - (q_fluid_to_solid_total_W - q_loss_avg_W)
     return {
         "y": y_new,
