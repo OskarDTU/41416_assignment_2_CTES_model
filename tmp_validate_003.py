@@ -8,7 +8,7 @@ window = dni.loc['2026-07-11 00:00:00+00:00':'2026-07-18 00:00:00+00:00']
 
 res = simulate(
     window,
-    initial_htf_inlet_temp_C=220.0,  # <-- Qui scegli il SOC iniziale (50% in questo caso)
+    initial_htf_inlet_temp_C=130.0,  # <-- Here you choose the initial SOC (0% in this case)
     initial_no_load_hours=0.0,
     respect_factory_schedule=True,
     factory_off_on_weekends=False,

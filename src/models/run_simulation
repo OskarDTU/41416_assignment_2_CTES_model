@@ -13,10 +13,10 @@ dni_df = pd.read_csv(dni_path, index_col=0, parse_dates=True)
 dni_df.index = pd.to_datetime(dni_df.index, utc=True).tz_localize(None)
 dni_series = dni_df['dni_wm2'].astype(float)
 
-results = simulate(dni_series, debug=False)  # debug=False per meno output sul terminale
-print('Simulazione completata.')
+results = simulate(dni_series, debug=False)  # debug=False for less output on the terminal
+print('Simulation completed.')
 
 csv_path = results.attrs.get('csv_path')
-print('CSV salvato in:', csv_path)
+print('CSV saved in:', csv_path)
 
 plot_simulation_results(csv_path=csv_path)
