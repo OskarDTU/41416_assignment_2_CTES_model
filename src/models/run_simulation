@@ -1,0 +1,22 @@
+import sys
+import os
+import pandas as pd
+
+project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..'))
+sys.path.insert(0, project_root)
+
+from src.models.Part_1 import simulate
+from src.features.data_presentation import plot_simulation_results
+
+dni_path = os.path.join(project_root, 'src', 'data', 'DNI_10m.csv')
+dni_df = pd.read_csv(dni_path, index_col=0, parse_dates=True)
+dni_df.index = pd.to_datetime(dni_df.index, utc=True).tz_localize(None)
+dni_series = dni_df['dni_wm2'].astype(float)
+
+results = simulate(dni_series, debug=False)  # debug=False per meno output sul terminale
+print('Simulazione completata.')
+
+csv_path = results.attrs.get('csv_path')
+print('CSV salvato in:', csv_path)
+
+plot_simulation_results(csv_path=csv_path)

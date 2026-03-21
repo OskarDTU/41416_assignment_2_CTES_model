@@ -531,7 +531,7 @@ def _module_energy_J(y_mod, T_ref):
     """
     _, T_s_mod = extract_profiles(y_mod)
     # Integrate solid sensible energy relative to reference temperature along z.
-    return float(rho_con * Cp_con * S_s * n_pipes * np.trapz(T_s_mod - T_ref, z_nodes))
+    return float(rho_con * Cp_con * S_s * n_pipes * np.trapezoid(T_s_mod - T_ref, z_nodes))
 
 
 def _module_fluid_energy_J(y_mod, T_ref):
@@ -551,8 +551,7 @@ def _module_fluid_energy_J(y_mod, T_ref):
         Sensible energy of the fluid volume inside one module relative to T_ref [J].
     """
     T_f_mod, _ = extract_profiles(y_mod)
-    # Integrate fluid sensible energy relative to reference temperature along z.
-    return float(rho_f * Cp_f * S_f * n_pipes * np.trapz(T_f_mod - T_ref, z_nodes))
+    return float(rho_f * Cp_f * S_f * n_pipes * np.trapezoid(T_f_mod - T_ref, z_nodes))
 
 
 def _module_heat_loss_W(y_mod):

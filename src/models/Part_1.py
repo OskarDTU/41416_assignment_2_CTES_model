@@ -195,7 +195,7 @@ def _compute_recirc_fraction(collector_t_out_C: float, htf_in_C: float, max_htf_
 def simulate(
 	dni_input: Union[str, float, int, pd.Series],
  	collector_efficiency: float = 0.47,
- 	collector_area_m2: float = 6000.0,
+ 	collector_area_m2: float = 6602.0,
  	initial_htf_inlet_temp_C: float = 130.0,
  	max_htf_temp_C: float = 310.0,
  	max_collector_flow_m3s: Optional[float] = None,

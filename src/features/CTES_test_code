@@ -1,0 +1,41 @@
+import numpy as np
+from scipy.integrate import solve_ivp
+import matplotlib.pyplot as plt
+
+from src.data.constants import (
+    rho_con, Cp_con, lambda_con,
+    D_int, D_ext,
+    lambda_iso, th_iso, epsilon_iso,
+    V_con, n_modules,
+    module_width, module_height, module_length,
+)
+
+lambda_con = lambda_con         # [W/m·K]
+D_int_pipe = D_int              # [m] Tube internal diameter
+D_ext_pipe = D_ext              # [m] Tube external diameter
+th_iso     = th_iso             # [m]
+eps_iso    = epsilon_iso        # [-]
+L_module   = float(module_length)   # [m]
+V_con_total = float(V_con)          # [m³]
+
+r_pipe_in  = D_int_pipe / 2    # [m] Internal radius (fluid side)       = a'
+r_pipe_out = D_ext_pipe / 2    # [m] External radius tube  
+
+## GEOMETRY OF THE EQUIVALENT ELEMENT (Buscemi et al., Fig. 10)
+# -----------------------------------------------------------------------
+# The total volume of concrete (V_con_total) is divided into
+# n_pipes x n_modules identical equivalent cylindrical elements.
+# Each element has:
+#   - length      L_module
+#   - volume      V_eq = V_con_total / (n_modules * n_pipes)
+#   - annular section S_s = V_eq / L_module
+#   - external radius r_eq  (= b in Jian et al. eq. 3.50)
+
+n_pipes  = 818                                      # [-] number of pipes per module (Buscemi et al., Tab. 1)
+V_eq     = V_con_total / (n_modules * n_pipes)      # [m³]  volume of the equivalent element
+S_s      = V_eq / L_module                          # [m²]  annular section of the equivalent element (concrete volume per unit length)
+r_eq     = np.sqrt(S_s / np.pi + r_pipe_out**2)     # [m]  external radius of the equivalent element (Buscemi et al., eq. 10)
+S_f      = np.pi * r_pipe_in**2                     # [m²]  annular section of the fluid side (internal tube)
+P        = np.pi * D_ext_pipe                       # [m]   perimeter of heat exchange (external tube)
+
+

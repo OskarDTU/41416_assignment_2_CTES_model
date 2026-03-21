@@ -1,0 +1,38 @@
+import pandas as pd
+import matplotlib.pyplot as plt
+
+path = r"src/data/20260320_144616/simulation_results_20260320_144616.csv"
+df = pd.read_csv(path)
+df['timestamp'] = pd.to_datetime(df['timestamp'])
+
+fig, axes = plt.subplots(3, 1, figsize=(12, 14), sharex=True)
+
+# 1) Solar collector
+axes[0].plot(df['timestamp'], df['htf_in_temp_C'], label='collector in (htf_in_temp_C)')
+axes[0].plot(df['timestamp'], df['collector_t_out_C'], label='collector out')
+axes[0].set_title('Solar collector')
+axes[0].set_ylabel('°C')
+axes[0].legend()
+axes[0].grid(True)
+
+# 2) CTES
+axes[1].plot(df['timestamp'], df['ctes_inlet_temp_C'], label='ctes in')
+axes[1].plot(df['timestamp'], df['ctes_temp_C'], label='ctes avg/temp')
+axes[1].set_title('CTES')
+axes[1].set_ylabel('°C')
+axes[1].legend()
+axes[1].grid(True)
+
+# 3) HEX
+axes[2].plot(df['timestamp'], df['hex_inlet_temp_C'], label='hex oil in')
+axes[2].plot(df['timestamp'], df['oil_out_C'], label='hex oil out')
+if 'water_out_C' in df.columns:
+    axes[2].plot(df['timestamp'], df['water_out_C'], label='hex water out', linestyle='--')
+axes[2].set_title('HEX')
+axes[2].set_ylabel('°C')
+axes[2].legend()
+axes[2].grid(True)
+axes[2].set_xlabel('time')
+
+plt.tight_layout()
+plt.show()
