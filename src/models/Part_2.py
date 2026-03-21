@@ -27,6 +27,7 @@ from src.data.constants import (
     V_con,
     rho_f, Cp_f,
     T_amb,
+    n_modules,
 )
 
 # --- Constants ---
@@ -49,18 +50,24 @@ def exergy_flow(m_dot, T_K, Cp):
     return m_dot * Cp * ((T_K - T_o) - T_o * np.log(T_K / T_o))
 
 
-def exergy_stored_profile(T_z0_C, T_mid_C, T_zmax_C):
+# Column names for the 14 module outlet temperatures saved by Part_1
+MODULE_COLS = [f"module_{i:02d}_Ts_outlet_C" for i in range(n_modules)]
+
+
+def exergy_stored_14modules(df_modules_C):
     """
-    Exergy stored in the CTES concrete [J], computed via Simpson's rule
-    over three axial nodes (z=0, z=L/2, z=L).
-    Works with both scalars and pandas Series.
+    Exergy stored in the CTES concrete [J], summed over 14 modules.
+    Each module has mass M_con / n_modules.
+
+    df_modules_C : DataFrame or 2-D array, shape (n_timesteps, 14) [°C]
+    Returns       : Series or 1-D array of total exergy stored [J]
     """
-    T_nodes_K = np.array([T_z0_C, T_mid_C, T_zmax_C]) + 273.15
-    ex_nodes  = (M_con / 3.0) * Cp_con * (
-        (T_nodes_K - T_o) - T_o * np.log(T_nodes_K / T_o)
+    T_K = np.asarray(df_modules_C, dtype=float) + 273.15  # (n_timesteps, 14)
+    M_mod = M_con / n_modules
+    ex_per_module = M_mod * Cp_con * (
+        (T_K - T_o) - T_o * np.log(T_K / T_o)
     )
-    # Simpson's rule: (1/6) * [f(0) + 4*f(L/2) + f(L)] * interval_length (=3)
-    return (ex_nodes[0] + 4.0 * ex_nodes[1] + ex_nodes[2]) / 6.0 * 3.0
+    return ex_per_module.sum(axis=1)
 
 
 # =============================================================================
@@ -79,21 +86,15 @@ def exergy_analysis(df):
     """
     df = df.copy()
 
-    # --- Fill NaN in concrete temperatures before any computation ---
-    for col in ["concrete_T_z0_C", "concrete_T_z_mid_C", "concrete_T_z_max_C"]:
+    # --- Fill NaN in module outlet temperatures before any computation ---
+    for col in MODULE_COLS:
         df[col] = df[col].interpolate(method="linear").bfill().ffill()
 
     # --- Average concrete temperature [K] (used for exergy heat loss) ---
-    df["T_con_avg_K"] = (
-        (df["concrete_T_z0_C"] + df["concrete_T_z_max_C"]) / 2.0 + 273.15
-    )
+    df["T_con_avg_K"] = df[MODULE_COLS].mean(axis=1) + 273.15
 
-    # --- Exergy stored in the concrete [J] ---
-    df["ex_stored_J"] = exergy_stored_profile(
-        df["concrete_T_z0_C"],
-        df["concrete_T_z_mid_C"],
-        df["concrete_T_z_max_C"],
-    )
+    # --- Exergy stored in the concrete [J] (14-module sum) ---
+    df["ex_stored_J"] = exergy_stored_14modules(df[MODULE_COLS])
 
     # --- Rate of change of stored exergy [W] ---
     df["dex_stored_dt_W"] = df["ex_stored_J"].diff() / dt
