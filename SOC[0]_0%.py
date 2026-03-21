@@ -17,7 +17,7 @@ window = dni_series.loc['2026-07-11':'2026-07-18']
 
 SOC_target = 0.50  
 
-T_min = 130.0
+T_min = 120.0
 T_max = 310.0
 T_init = T_min + SOC_target * (T_max - T_min)
 

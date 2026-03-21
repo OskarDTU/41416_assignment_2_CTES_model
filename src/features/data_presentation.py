@@ -137,8 +137,8 @@ def _write_summary_table_from_csv(summary_csv_path: str, out_dir: str) -> Option
 
     rows_pct = [
         ('Solar fraction (direct + CTES)', _get('solar_fraction'), '[%]', True),
-        ('Solar capture efficiency', capture_eff, '[%]', True),
-        ('CTES RTE (SOC-adjusted)', _get('ctes_round_trip_efficiency'), '[%]', True),
+        ('Available solar captured', capture_eff, '[%]', True),
+        ('CTES RTE (SoC-adjusted)', _get('ctes_round_trip_efficiency'), '[%]', True),
     ]
 
     latex_lines = [
@@ -155,7 +155,14 @@ def _write_summary_table_from_csv(summary_csv_path: str, out_dir: str) -> Option
     latex_lines.append('\\hline')
     for name, val, unit, is_pct in rows_pct:
         latex_lines.append(f'{name} & {_fmt(val, pct=is_pct)} & {_unit_tex(unit)} \\\\')
-    latex_lines.extend(['\\hline', '\\end{tabular}', '\\end{table}', ''])
+    latex_lines.extend([
+        '\\hline',
+        '\\end{tabular}',
+        '\\caption{Summary of CTES simulation energy flows and key performance indicators.}',
+        '\\label{tab:ctes-simulation-summary}',
+        '\\end{table}',
+        ''
+    ])
 
     latex_path = os.path.join(out_dir, 'simulation_summary_table.tex')
     try:
@@ -414,6 +421,48 @@ def plot_simulation_results(csv_path: Optional[str] = None, out_pdf: Optional[st
     flow_pdf = os.path.join(out_dir, 'htf_flow_rates.pdf')
     fig4.savefig(flow_pdf, bbox_inches='tight')
     print(f'Figure saved: {flow_pdf}')
+
+    # Figure 5: CTES charging diagnostics (raw vs net transfer and curtailment)
+    fig5, (ax51, ax52) = plt.subplots(2, 1, figsize=(FIG_WIDTH_A4, 6.8), sharex=True)
+
+    p_ctes_charge_raw = _series(df, 'ctes_charge_raw_W', 1 / 1000.0)
+    # Backward compatibility when older CSVs do not include raw/net split yet.
+    if p_ctes_charge_raw.isna().all():
+        p_ctes_charge_raw = _series(df, 'ctes_charge_htf_W', 1 / 1000.0)
+    p_ctes_charge_net = _series(df, 'ctes_charge_net_W', 1 / 1000.0)
+    if p_ctes_charge_net.isna().all():
+        p_ctes_charge_net = _series(df, 'ctes_charge_input_W', 1 / 1000.0)
+    p_ctes_charge_inf = _series(df, 'ctes_charge_inferred_W', 1 / 1000.0)
+    p_ctes_loss = _series(df, 'ctes_current_loss_kW', 1.0)
+
+    ax51.plot(df.index, p_ctes_charge_raw, label='Charge raw (fluid->solid)', lw=2.6, color='tab:green')
+    ax51.plot(df.index, p_ctes_charge_net, label='Charge net (to solid)', lw=2.4, color='tab:blue')
+    ax51.plot(df.index, p_ctes_charge_inf, label='Charge inferred', lw=2.0, color='tab:purple', ls=':')
+    ax51.plot(df.index, p_ctes_loss, label='Thermal loss', lw=2.0, color='tab:red')
+    ax51.axhline(0.0, color='black', lw=1.3, alpha=0.6)
+    ax51.set_ylabel('CTES power [kW]')
+    ax51.grid(True, alpha=0.3)
+    _legend_below(ax51, ncol=2)
+
+    p_solar_raw = _series(df, 'solar_power_raw_W', 1 / 1000.0)
+    p_solar_eff = _series(df, 'solar_power_effective_W', 1 / 1000.0)
+    p_solar_curt = _series(df, 'solar_power_curtailed_W', 1 / 1000.0)
+    p_col_to_ctes = _series(df, 'ctes_charge_htf_W', 1 / 1000.0)
+    ax52.plot(df.index, p_solar_raw, label='Solar potential', lw=2.4, color='black')
+    ax52.plot(df.index, p_solar_eff, label='Solar effective', lw=2.2, color='tab:orange')
+    ax52.plot(df.index, p_solar_curt, label='Solar curtailed', lw=2.2, color='tab:red')
+    ax52.plot(df.index, p_col_to_ctes, label='To CTES channel', lw=2.2, color='tab:green', ls='--')
+    ax52.set_ylabel('Solar / channel [kW]')
+    ax52.grid(True, alpha=0.3)
+    _legend_below(ax52, ncol=2)
+
+    _format_time_axis(ax51, x0, x1)
+    _format_time_axis(ax52, x0, x1)
+
+    fig5.tight_layout()
+    diag_pdf = os.path.join(out_dir, 'ctes_charging_diagnostics.pdf')
+    fig5.savefig(diag_pdf, bbox_inches='tight')
+    print(f'Figure saved: {diag_pdf}')
 
 
 if __name__ == '__main__':

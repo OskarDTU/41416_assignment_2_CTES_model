@@ -1437,7 +1437,7 @@ if __name__ == "__main__":
 	print("Call `simulate(dni_series_or_path, ...)` from your scripts or notebooks.")
 	# Quick smoke-run when invoked directly: use the provided DNI file and defaults
 	try:
-		csv_in = 'src/data/DNI_10m.csv'
+		csv_in = 'src/data/DNI_10m_3days.csv'
 		# if running in an interactive terminal, enable interactive prompts and debug
 		if sys.stdin is not None and sys.stdin.isatty():
 			results = simulate(csv_in, debug=True, interactive=True)
