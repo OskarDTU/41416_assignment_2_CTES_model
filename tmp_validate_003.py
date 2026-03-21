@@ -4,17 +4,18 @@ from src.models.Part_1 import simulate
 dni = pd.read_csv('src/data/DNI_10m.csv')
 dni['time'] = pd.to_datetime(dni['time'])
 dni = dni.set_index('time')['dni_wm2']
-window = dni.loc['2026-07-14 06:00:00+00:00':'2026-07-14 14:00:00+00:00']
+window = dni.loc['2026-07-11 00:00:00+00:00':'2026-07-18 00:00:00+00:00']
 
 res = simulate(
     window,
+    initial_htf_inlet_temp_C=220.0,  # <-- Qui scegli il SOC iniziale (50% in questo caso)
     initial_no_load_hours=0.0,
     respect_factory_schedule=True,
     factory_off_on_weekends=False,
     disable_flow_rate_limits=False,
     max_ctes_flow_m3s=0.03,
     debug=False,
-    interactive=False,
+    interactive=False
 )
 
 curt = float(res['solar_power_curtailed_W'].sum()*600/3.6e9)
