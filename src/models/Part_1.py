@@ -71,29 +71,6 @@ def _load_dni_input(dni_input: Union[str, float, int, pd.Series]) -> Union[float
 		raise ValueError("Could not find a numeric DNI column in CSV")
 	raise TypeError("dni_input must be a path, float, int, or pandas Series")
 
-# To Oskar and Federico: This is what you want to replace with your fancy CTES model. Believe this one is completely useless.
-def _ctes_stub_step(state: dict, power_W: float, dt_s: float):
-	"""Very small placeholder CTES model.
-
-	Inputs:
-	- state: dict with keys `energy_J`, `capacity_J`, `min_temp_C`, `max_temp_C`.
-	- power_W: positive => charging, negative => discharging (W)
-	- dt_s: timestep seconds
-
-	Returns updated state and `provided_power_W` (power the CTES could supply to meet a discharge request).
-	This is intentionally simple: stores/withdraws energy and updates an effective temperature.
-	"""
-	dE = power_W * dt_s
-	state["energy_J"] = max(0.0, min(state["capacity_J"], state.get("energy_J", 0.0) + dE))
-	# update a naive temperature proxy from stored energy fraction
-	frac = state["energy_J"] / state["capacity_J"] if state["capacity_J"] > 0 else 0.0
-	state["temp_C"] = state["min_temp_C"] + frac * (state["max_temp_C"] - state["min_temp_C"])
-	# available instantaneous discharge power is limited by a max discharge rate
-	max_discharge_W = state.get("max_discharge_W", 5e6)
-	available_power = min(max_discharge_W, state["energy_J"] / max(dt_s, 1.0))
-	return state, available_power
-
-
 #Oil/water heat exchanger model for supplying hot water to the pasta factory.
 def oil_water_hex(
 	oil_in_C: float,
@@ -808,7 +785,6 @@ def simulate(
 		else:
 			# fallback to stub behaviour if detailed model is not available
 			if ctes_contribution_W > 0:
-				ctes, _ = _ctes_stub_step(ctes, -ctes_contribution_W, timestep_seconds)
 				ctes_to_factory_W = ctes_contribution_W
 				ctes_flow_dir = 'to_hex'
 
@@ -951,7 +927,6 @@ def simulate(
 				if actual_charge_W > 0 and ctes_flow_dir == 'none':
 					ctes_flow_dir = 'to_coll'
 			else:
-				ctes, _ = _ctes_stub_step(ctes, remaining_solar_W, timestep_seconds)
 				actual_charge_W = remaining_solar_W
 				actual_charge_display_W = remaining_solar_W
 				if ctes_flow_dir == 'none':
