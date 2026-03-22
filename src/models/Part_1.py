@@ -25,12 +25,13 @@ except Exception:
 		solar_collector_outlet_temperature = None
 
 try:
-    from ..features.ctes_1d_jian import init_ctes_state, step_ctes, stored_energy_J, T_outlet, extract_profiles, heat_loss_W
+    from ..features.ctes_1d_jian import init_ctes_state, step_ctes, stored_energy_J, T_outlet, extract_profiles, heat_loss_W, N_z as _CTES_N_z
 except Exception:
 	try:
-		from features.ctes_1d_jian import init_ctes_state, step_ctes, stored_energy_J, T_outlet, extract_profiles, heat_loss_W
+		from features.ctes_1d_jian import init_ctes_state, step_ctes, stored_energy_J, T_outlet, extract_profiles, heat_loss_W, N_z as _CTES_N_z
 	except Exception:
 		init_ctes_state = step_ctes = stored_energy_J = T_outlet = extract_profiles = heat_loss_W = None
+		_CTES_N_z = 30
 
 try:
 	from ..data.constants import n_modules as ctes_series_modules
@@ -1300,6 +1301,13 @@ def simulate(
 		except Exception:
 			ctes_temp_csv = np.nan
 
+		# --- 14 module outlet concrete temperatures ---
+		if ctes_y is not None and extract_profiles is not None:
+			_, _T_s_all = extract_profiles(ctes_y)
+			_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": float(_T_s_all[(i + 1) * _CTES_N_z - 1]) for i in range(ctes_series_modules)}
+		else:
+			_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": np.nan for i in range(ctes_series_modules)}
+
 		records.append(
 			{
 				"timestamp": ts,
@@ -1360,6 +1368,7 @@ def simulate(
 				"ctes_balance_residual_state_W": ctes_balance_residual_state_W,
 				"ctes_balance_residual_with_loss_W": ctes_balance_residual_with_loss_W,
 				"hex_flow_balance_m3s": hex_flow_balance_m3s,
+				**_mod_outlets,
 			}
 		)
 

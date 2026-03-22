@@ -15,7 +15,7 @@ dni_df.index = pd.to_datetime(dni_df.index, utc=True).tz_localize(None)
 dni_series = dni_df['dni_wm2'].astype(float)
 window = dni_series.loc['2026-07-11':'2026-07-18']
 
-SOC_target = 0.50  
+SOC_target = 0  
 
 T_min = 120.0
 T_max = 310.0
