@@ -1,0 +1,5 @@
+Configuration,Duration [h],X_in [MWh],X_out [MWh],X_loss [MWh],X_dest [MWh],dX_stored [MWh]
+Charging,92.2,50.8537,12.2407,2.3946,4.5504,31.8026
+Discharging,56.3,31.4024,52.2759,1.4723,1.294,-28.3913
+Standby,19.7,0.0,0.0,0.5128,0.0183,-0.5264
+TOTAL,168.2,82.2561,64.5166,4.3797,5.8627,2.8849
