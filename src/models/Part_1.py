@@ -15,6 +15,23 @@ from datetime import timedelta
 from CoolProp.CoolProp import PropsSI
 import os
 import sys
+
+
+def _play_completion_sound(success: bool = True) -> None:
+	"""Play a short completion sound with a Windows-first fallback."""
+	try:
+		if os.name == "nt":
+			import winsound
+			winsound.MessageBeep(winsound.MB_ICONASTERISK if success else winsound.MB_ICONHAND)
+			return
+	except Exception:
+		pass
+	# Fallback terminal bell for non-Windows or environments without winsound.
+	try:
+		print("\a", end="", flush=True)
+	except Exception:
+		pass
+
 # try both relative and absolute import styles so this module is usable
 try:
 	from ..features.solarpower import solar_collector_outlet_temperature
@@ -158,7 +175,7 @@ def simulate(
 	dni_input: Union[str, float, int, pd.Series],
  	collector_efficiency: float = 0.47,
  	collector_area_m2: float = 6602.0,
-	initial_htf_inlet_temp_C: float = 135.0,
+	initial_htf_inlet_temp_C: float = 140.0,
  	max_htf_temp_C: float = 310.0,
  	max_collector_flow_m3s: Optional[float] = None,
  	max_pump_flow_m3s: Optional[float] = None,
@@ -174,12 +191,15 @@ def simulate(
 	early_sun_start_hour: int = 6,
 	early_sun_end_hour: int = 11,
 	early_sun_collector_overdrive_factor: float = 1.0,
+	factory_charge_hot_solid_margin_C: float = 0.5,
+	off_factory_charge_hot_solid_margin_C: float = 0.05,
 	enable_inner_coupled_solver: bool = True,
-	inner_solver_max_iter: int = 6,
+	inner_solver_max_iter: int = 12,
 	inner_solver_relaxation: float = 0.35,
 	enable_flow_optimizer: bool = True,
-	flow_optimizer_grid_points: int = 9,
+	flow_optimizer_grid_points: int = 18,
 	flow_optimizer_use_full_ctes_eval: bool = False,
+	auto_run_presentation: bool = True,
  	debug: bool = False,
  	interactive: bool = False,
 ):
@@ -190,6 +210,18 @@ def simulate(
 	"""
 	if solar_collector_outlet_temperature is None:
 		raise RuntimeError("solar_collector_outlet_temperature is unavailable. Ensure features.solarpower is importable.")
+
+	# Quick opt-out for recent charging-control changes.
+	# Usage (PowerShell): $env:CTES_USE_LEGACY_CHARGING='1'
+	# This keeps existing scripts unchanged while forcing legacy behavior.
+	legacy_charging_env = os.getenv("CTES_USE_LEGACY_CHARGING", "0").strip().lower()
+	if legacy_charging_env in ("1", "true", "yes", "on"):
+		enable_flow_optimizer = False
+	if enable_flow_optimizer:
+		print("Charging control mode: optimized flow controller (enable_flow_optimizer=True)")
+	else:
+		reason = "CTES_USE_LEGACY_CHARGING" if legacy_charging_env in ("1", "true", "yes", "on") else "enable_flow_optimizer=False"
+		print(f"Charging control mode: legacy ({reason})")
 
 	dni = _load_dni_input(dni_input)
 	# Ensure a datetime index for iteration
@@ -287,6 +319,7 @@ def simulate(
 	# Main loop iterating over DNI time series
 	last_prompt_hour = -1
 	last_progress_hour = -1
+	last_hourly_diag_hour = -1
 	total_ctes_discharge_iterations = 0
 	ctes_discharge_solve_events = 0
 	max_ctes_discharge_iterations = 0
@@ -296,6 +329,15 @@ def simulate(
 	hourly_bucket_hour = None
 	hourly_mode_counts = {}
 	prev_ctes_discharge_flow_m3s = 0.0
+	prev_ctes_charge_flow_m3s = 0.0
+	prev_hex_recirc_flow_m3s = 0.0
+	# Charging-flow shaping knobs (optimizer mode):
+	# keep a minimum thermal headroom by reducing charge flow when T_in to CTES is
+	# too close to CTES charging outlet, and limit ramp rate to suppress artifacts.
+	charge_quality_target_dT_C = 18.0
+	charge_quality_min_flow_frac = 0.20
+	charge_slew_up_m3s_per_step = 0.003
+	charge_slew_down_m3s_per_step = 0.006
 	first_debug_print = True
 	debug_table_header_printed = False
 	# Initialize CTES step debug variables to avoid undefined local references
@@ -313,9 +355,13 @@ def simulate(
 		ctes_state_advanced = False
 		requested_ctes_to_factory_W = 0.0
 		m_ctes_charge_use_m3s = 0.0
+		charge_quality_dT_C = np.nan
+		charge_quality_factor = np.nan
+		charge_flow_slew_limited = False
 		actual_charge_W = 0.0
 		actual_charge_display_W = 0.0
 		ctes_model_diag = None
+		downstream_curtail_W = 0.0
 		res = None  # compatibility for static analyzers with stale flow inference
 		res_step = None
 		# compute minute-of-hour for gating debug prints/prompts
@@ -380,6 +426,9 @@ def simulate(
 		m_ctes_overflow_reduction = 0.0
 		m_ctes_discharge_fit_reduction = 0.0
 		ctes_flow_limit_reason = 'none'
+		hex_enforce_reason = 'na'
+		mode_c_possible = False
+		mode_c_blocker = 'na'
 		ctes_discharge_solver_mode = 'none'
 		ctes_discharge_iterations = 0
 		ctes_charge_iterations = 0
@@ -388,6 +437,18 @@ def simulate(
 		flow_optimizer_best_objective_W = np.nan
 		flow_optimizer_best_charge_flow_m3s = 0.0
 		flow_optimizer_factory_shortfall_W = np.nan
+		ctes_charge_gate_reason = 'na'
+		ctes_hot_solid_C = np.nan
+		ctes_charge_margin_C = np.nan
+		ctes_qf2s_total_W = np.nan
+		ctes_q2solid_corr_W = np.nan
+		ctes_qhtf_sensible_W = np.nan
+		coupled_charge_iters = 0
+		coupled_charge_converged = False
+		coupled_charge_dTin_C = np.nan
+		hex_oil_out_target_primary_C = np.nan
+		hex_oil_out_target_fallback_C = np.nan
+		hex_oil_out_target_used_C = np.nan
 
 		# compute solar collector output (uses volumetric flow for Paratherm NF)
 		# First compute available solar power (independent of flow)
@@ -421,10 +482,12 @@ def simulate(
 		inner_solver_dTin_C = np.nan
 		inner_solver_dm_col_m3s = np.nan
 		inner_solver_converged = False
+		charge_flow_temp_limited = False
+		charge_temp_target_C = np.nan
 
 		# Optional flow optimizer: choose collector flow that maximizes expected
 		# CTES charging while prioritizing factory supply when active.
-		if enable_flow_optimizer and (solar_power_available_W > 0.0) and (step_ctes is not None) and (ctes_y is not None):
+		if enable_flow_optimizer and factory_active and (solar_power_available_W > 0.0) and (step_ctes is not None) and (ctes_y is not None):
 			collector_t_in_C = float(htf_in_temp_C)
 			rho_opt, cp_opt = _htf_props_at(collector_t_in_C)
 			grid_n = max(3, int(flow_optimizer_grid_points))
@@ -469,6 +532,7 @@ def simulate(
 
 				m_charge_cand = flow_cand
 				factory_shortfall = 0.0
+				surplus_after_factory = 0.0
 				if factory_active:
 					T_out_min_req_C = factory_water_target_C + pinch_delta_C
 					dT_src = max(1e-6, T_out_cand - T_out_min_req_C)
@@ -478,6 +542,7 @@ def simulate(
 					m_charge_cand = max(0.0, flow_cand - m_hex_use)
 					factory_supply_est = min(P_col, m_hex_use * rho_opt * cp_opt * dT_src)
 					factory_shortfall = max(0.0, factory_load_W - factory_supply_est)
+					surplus_after_factory = max(0.0, P_col - factory_supply_est)
 
 				objective = 0.0
 				if m_charge_cand > 0.0:
@@ -498,8 +563,21 @@ def simulate(
 						q_proxy = m_charge_cand * rho_opt * cp_opt * dT_charge
 						objective = max(0.0, min(P_col, q_proxy))
 
+				# Additional charging objective beyond collector surplus does not
+				# reduce curtailment; saturate objective there.
+				objective_eff = float(objective)
 				if factory_active:
-					key = (-float(factory_shortfall), float(objective), float(m_charge_cand), float(flow_cand))
+					objective_eff = min(float(objective), float(surplus_after_factory))
+
+				if factory_active:
+					# Priority: serve factory, absorb useful surplus, then prefer hotter
+					# outlet and lower flow for CTES chargeability.
+					key = (
+						-float(factory_shortfall),
+						float(objective_eff),
+						float(T_out_cand),
+						-float(flow_cand),
+					)
 				else:
 					key = (float(objective), float(m_charge_cand), float(flow_cand))
 
@@ -569,19 +647,141 @@ def simulate(
 			m_col_vol_flow_m3s = float(m_prev)
 		elif flow_optimizer_mode == 'legacy':
 			# Fallback: solar-driven flow sizing constrained by max collector outlet temperature.
-			rho_htf, cp_htf = _htf_props_at(htf_in_temp_C)
-			deltaT_limit = max_htf_temp_C - htf_in_temp_C
-			if deltaT_limit <= 0:
-				m_col_vol_flow_m3s = 0.0
+			if not factory_active:
+				# In charging-only mode, start from maximum allowed collector flow.
+				# A later thermal gate may reduce it to satisfy CTES inlet constraints.
+				m_col_vol_flow_m3s = _cap_collector_flow(float(collector_flow_hard_cap_step_m3s))
 			else:
-				try:
-					cp_ctrl = PropsSI("C", "T", ((htf_in_temp_C + max_htf_temp_C) / 2.0) + 273.15, "Q", 0, fluid)
-				except Exception:
-					cp_ctrl = cp_htf
-				cp_ctrl = max(float(cp_ctrl), 1e-9)
-				m_dot_mass_needed = solar_power_available_W / (cp_ctrl * max(deltaT_limit, 1e-9))
-				m_col_vol_flow_m3s = _cap_collector_flow(m_dot_mass_needed / rho_htf)
+				rho_htf, cp_htf = _htf_props_at(htf_in_temp_C)
+				deltaT_limit = max_htf_temp_C - htf_in_temp_C
+				if deltaT_limit <= 0:
+					m_col_vol_flow_m3s = 0.0
+				else:
+					try:
+						cp_ctrl = PropsSI("C", "T", ((htf_in_temp_C + max_htf_temp_C) / 2.0) + 273.15, "Q", 0, fluid)
+					except Exception:
+						cp_ctrl = cp_htf
+					cp_ctrl = max(float(cp_ctrl), 1e-9)
+					m_dot_mass_needed = solar_power_available_W / (cp_ctrl * max(deltaT_limit, 1e-9))
+					m_col_vol_flow_m3s = _cap_collector_flow(m_dot_mass_needed / rho_htf)
 			collector_t_in_C = float(htf_in_temp_C)
+
+		# When factory is on, avoid choosing an over-high collector flow that drives
+		# collector outlet below the usable fallback HEX inlet target.
+		if factory_active and (solar_power_available_W > 0.0) and (m_col_vol_flow_m3s > 1e-9):
+			factory_collector_temp_target_C = float(target_hex_htf_temp_fallback_C)
+			# When solar surplus exists, demand a hotter collector outlet so spare
+			# collector energy can still charge a hot CTES.
+			if (ctes_y is not None) and (extract_profiles is not None) and (solar_power_available_W > 1.05 * max(0.0, factory_load_W)):
+				try:
+					_, _T_s_prof_fac = extract_profiles(ctes_y)
+					ctes_hot_solid_fac_C = float(np.nanmax(np.asarray(_T_s_prof_fac, dtype=float)))
+				except Exception:
+					ctes_hot_solid_fac_C = np.nan
+				if np.isfinite(ctes_hot_solid_fac_C):
+					factory_collector_temp_target_C = max(
+						factory_collector_temp_target_C,
+						ctes_hot_solid_fac_C + float(factory_charge_hot_solid_margin_C),
+					)
+					charge_temp_target_C = factory_collector_temp_target_C
+			def _collector_out_factory_at_flow(flow_m3s: float) -> tuple[float, float]:
+				try:
+					_col_try = solar_collector_outlet_temperature(
+						t_in=collector_t_in_C,
+						m_dot=float(flow_m3s),
+						dni=float(dni_value) if not pd.isna(dni_value) else 0.0,
+						efficiency=collector_efficiency,
+						area=collector_area_m2,
+						volumetric=True,
+						temp_unit="C",
+					)
+					T_try = float(_col_try.get("t_out_C", np.nan))
+					P_try = float(max(0.0, _col_try.get("power_W", 0.0)))
+				except Exception:
+					return np.nan, 0.0
+				if np.isfinite(T_try) and (T_try > max_htf_temp_C):
+					T_try = float(max_htf_temp_C)
+					rho_try, cp_try = _htf_props_at(collector_t_in_C)
+					P_try = max(0.0, float(flow_m3s) * rho_try * cp_try * max(0.0, T_try - collector_t_in_C))
+				return T_try, P_try
+
+			T_hi_try, _ = _collector_out_factory_at_flow(float(m_col_vol_flow_m3s))
+			if np.isfinite(T_hi_try) and (T_hi_try < factory_collector_temp_target_C - 1e-6):
+				lo = 0.0
+				hi = float(m_col_vol_flow_m3s)
+				best = 0.0
+				for _ in range(18):
+					mid = 0.5 * (lo + hi)
+					if mid <= 1e-12:
+						break
+					T_mid_try, _ = _collector_out_factory_at_flow(mid)
+					if np.isfinite(T_mid_try) and (T_mid_try >= factory_collector_temp_target_C):
+						best = mid
+						lo = mid
+					else:
+						hi = mid
+				if best > 1e-9:
+					T_best_try, P_best_try = _collector_out_factory_at_flow(best)
+					# Do not accept a temperature-driven flow reduction if it would
+					# undercut factory duty at this timestep.
+					if (factory_load_W <= 0.0) or (P_best_try >= 1.01 * factory_load_W):
+						m_col_vol_flow_m3s = _cap_collector_flow(best)
+						charge_flow_temp_limited = True
+
+		# For charging-only periods, iteratively reduce collector flow (if needed)
+		# so collector outlet remains above CTES hottest solid node.
+		if (not factory_active) and (solar_power_available_W > 0.0) and (ctes_y is not None):
+			ctes_hot_solid_for_flow_C = np.nan
+			if extract_profiles is not None:
+				try:
+					_, _T_s_prof_flow = extract_profiles(ctes_y)
+					ctes_hot_solid_for_flow_C = float(np.nanmax(np.asarray(_T_s_prof_flow, dtype=float)))
+				except Exception:
+					ctes_hot_solid_for_flow_C = np.nan
+			if np.isfinite(ctes_hot_solid_for_flow_C):
+				# Keep a small but non-trivial thermal margin above hottest solid so
+				# tiny numerical jitter does not flip charging on/off.
+				charge_temp_target_C = float(ctes_hot_solid_for_flow_C) + float(off_factory_charge_hot_solid_margin_C)
+				flow_hi = _cap_collector_flow(max(0.0, float(m_col_vol_flow_m3s)))
+				if flow_hi > 1e-9:
+					def _collector_out_at_flow(flow_m3s: float) -> float:
+						try:
+							_col_try = solar_collector_outlet_temperature(
+								t_in=collector_t_in_C,
+								m_dot=float(flow_m3s),
+								dni=float(dni_value) if not pd.isna(dni_value) else 0.0,
+								efficiency=collector_efficiency,
+								area=collector_area_m2,
+								volumetric=True,
+								temp_unit="C",
+							)
+							return float(_col_try.get("t_out_C", np.nan))
+						except Exception:
+							return np.nan
+
+					T_hi = _collector_out_at_flow(flow_hi)
+					if np.isfinite(T_hi) and (T_hi < charge_temp_target_C):
+						# Maximize absorbed solar while respecting CTES charging inlet constraint.
+						lo = 0.0
+						hi = flow_hi
+						best = 0.0
+						for _ in range(18):
+							mid = 0.5 * (lo + hi)
+							if mid <= 1e-12:
+								break
+							T_mid = _collector_out_at_flow(mid)
+							if np.isfinite(T_mid) and (T_mid >= charge_temp_target_C):
+								best = mid
+								lo = mid
+							else:
+								hi = mid
+						if best > 1e-9:
+							m_col_vol_flow_m3s = _cap_collector_flow(best)
+							charge_flow_temp_limited = True
+						else:
+							# No feasible charging inlet temperature at this DNI/inlet condition.
+							m_col_vol_flow_m3s = 0.0
+							charge_flow_temp_limited = True
 
 		# Use the control-solved collector inlet for field power/outlet evaluation.
 		rho_htf, cp_htf = _htf_props_at(collector_t_in_C)
@@ -662,15 +862,16 @@ def simulate(
 		# target feed to HEX
 		m_req = target_hex_htf_flow_m3s if factory_active else 0.0
 		# provisional target for mixing control.
-		# In CTES-only mode (no collector stream), keep primary target (182 C).
+		# Use primary target only when at least one active source can thermally reach it.
 		if not factory_active:
 			T_req = target_hex_htf_temp_C
-		elif (m_col_avail <= 1e-9) or np.isnan(T_col):
-			T_req = target_hex_htf_temp_C
-		elif T_col >= target_hex_htf_temp_C:
-			T_req = target_hex_htf_temp_C
 		else:
-			T_req = target_hex_htf_temp_fallback_C
+			col_can_primary = bool((m_col_avail > 1e-9) and (not np.isnan(T_col)) and (T_col >= target_hex_htf_temp_C))
+			ctes_can_primary = bool((m_ctes_discharge_avail > 1e-9) and np.isfinite(T_ctes) and (T_ctes >= target_hex_htf_temp_C))
+			if col_can_primary or ctes_can_primary:
+				T_req = target_hex_htf_temp_C
+			else:
+				T_req = target_hex_htf_temp_fallback_C
 
 		# start by using as much collector flow as reasonable up to m_req
 		m_col_use = min(m_col_avail, m_req)
@@ -686,12 +887,22 @@ def simulate(
 			# determine the required external flow and leave spare HEX capacity for recirculation.
 			m_ctes_needed = 0.0
 
-		# Also request CTES support based on power shortfall (not only temperature shortfall),
-		# so sunrise periods do not fall into collector-only backup-heavy behavior.
+		# Also request CTES support based on factory shortfall using a
+		# temperature-feasible estimate of collector support (not raw solar power).
+		# Feasibility against active HEX inlet target is enforced later by the HEX gate.
 		if factory_active and m_ctes_discharge_avail > 0 and T_ctes > ctes_min_discharge_temp_C:
-			power_shortfall_W = max(0.0, factory_load_W - max(0.0, solar_power_W))
+			T_out_min_req_C = factory_water_target_C + pinch_delta_C
+			if np.isfinite(T_col) and (m_col_avail > 1e-12):
+				dT_src_col = max(0.0, float(T_col) - float(T_out_min_req_C))
+				solar_support_est_W = min(
+					max(0.0, solar_power_W),
+					max(0.0, m_col_avail * rho_htf * cp_htf * dT_src_col),
+				)
+			else:
+				solar_support_est_W = 0.0
+			power_shortfall_W = max(0.0, factory_load_W - solar_support_est_W)
 			if power_shortfall_W > 0.0:
-				T_sink_ref_C = max(factory_water_target_C + pinch_delta_C, htf_in_temp_C)
+				T_sink_ref_C = max(T_out_min_req_C, htf_in_temp_C)
 				deltaT_support = max(1e-6, T_ctes - T_sink_ref_C)
 				m_ctes_needed_power = power_shortfall_W / max(rho_htf * cp_htf * deltaT_support, 1e-9)
 				m_ctes_needed = max(m_ctes_needed, m_ctes_needed_power)
@@ -808,6 +1019,164 @@ def simulate(
 			m_w = factory_water_flow_m3s * rho_w
 			desired_water_power_W = m_w * cp_w * (water_target_used_C - factory_water_in_C)
 
+			# Expected HEX oil outlet targets from fixed HEX inlet targets and water-side
+			# duty, using CoolProp properties at the inlet target temperatures.
+			def _expected_hex_oil_outlet_target(T_hex_in_target_C: float, water_target_C: float) -> float:
+				try:
+					rho_w_t = PropsSI("D", "T", factory_water_in_C + 273.15, "P", 8e5, "Water")
+					cp_w_t = PropsSI("C", "T", factory_water_in_C + 273.15, "P", 8e5, "Water")
+				except Exception:
+					rho_w_t = 1000.0
+					cp_w_t = 4180.0
+				Qw_target_W = factory_water_flow_m3s * rho_w_t * cp_w_t * (water_target_C - factory_water_in_C)
+				try:
+					rho_o_t = PropsSI("D", "T", T_hex_in_target_C + 273.15, "Q", 0, fluid)
+					cp_o_t = PropsSI("C", "T", T_hex_in_target_C + 273.15, "Q", 0, fluid)
+				except Exception:
+					rho_o_t = 870.0
+					cp_o_t = 2200.0
+				m_dot_o_t = max(1e-9, float(m_req) * float(rho_o_t))
+				dT_o = max(0.0, Qw_target_W) / max(1e-9, m_dot_o_t * max(1e-9, float(cp_o_t)))
+				return float(T_hex_in_target_C - dT_o)
+
+			hex_oil_out_target_primary_C = _expected_hex_oil_outlet_target(float(target_hex_htf_temp_C), float(factory_water_target_C))
+			hex_oil_out_target_fallback_C = _expected_hex_oil_outlet_target(float(target_hex_htf_temp_fallback_C), float(factory_water_fallback_C))
+			hex_oil_out_target_used_C = (
+				hex_oil_out_target_fallback_C if fallback_mode_active else hex_oil_out_target_primary_C
+			)
+
+		def _estimate_oil_return_at_target(T_hex_in_target_C: float, m_oil_total_m3s: float) -> float:
+			"""Estimate HEX oil outlet at fixed inlet target using cp at target temperature."""
+			if (not factory_active) or (m_oil_total_m3s <= 1e-12):
+				return float(T_hex_in_target_C)
+			try:
+				rho_oil_tgt = PropsSI("D", "T", float(T_hex_in_target_C) + 273.15, "Q", 0, fluid)
+				cp_oil_tgt = PropsSI("C", "T", float(T_hex_in_target_C) + 273.15, "Q", 0, fluid)
+			except Exception:
+				rho_oil_tgt = 870.0
+				cp_oil_tgt = 2200.0
+			m_dot_oil_tgt = max(1e-9, float(m_oil_total_m3s) * float(rho_oil_tgt))
+			delta_t = max(0.0, float(desired_water_power_W)) / max(1e-9, m_dot_oil_tgt * max(1e-9, float(cp_oil_tgt)))
+			return float(T_hex_in_target_C - delta_t)
+
+		def _enforce_hex_target_with_recirculation(
+			m_col_in_m3s: float,
+			m_ctes_in_m3s: float,
+			T_ctes_stream_C: float,
+			recirc_guess_m3s: float,
+		) -> tuple[float, float, float, float, float, float, bool, str]:
+			"""Solve external-flow split so HEX inlet target and total HEX flow are met."""
+			m_col_cap = max(0.0, min(float(m_col_in_m3s), float(m_col_avail)))
+			m_ctes_cap = max(0.0, float(m_ctes_in_m3s))
+			if (not factory_active) or (m_req <= 0.0):
+				T_mix_ext_loc = _safe_mix_temp(m_col_cap, T_col, m_ctes_cap, T_ctes_stream_C, htf_in_temp_C)
+				return m_col_cap, m_ctes_cap, 0.0, 0.0, T_mix_ext_loc, np.nan, False, 'no_factory_or_flow'
+
+			target_tol_C = 0.5
+			T_target = float(mix_target_used_C)
+			T_ret = float(_estimate_oil_return_at_target(T_target, float(m_req)))
+			RHS = float(m_req) * max(0.0, (T_target - T_ret))
+
+			A_col = (float(T_col) - T_ret) if (np.isfinite(T_col) and (m_col_cap > 1e-12)) else -1.0
+			A_ctes = (float(T_ctes_stream_C) - T_ret) if (np.isfinite(T_ctes_stream_C) and (m_ctes_cap > 1e-12)) else -1.0
+
+			# CTES colder than inlet target cannot contribute to meeting that target.
+			if np.isfinite(T_ctes_stream_C) and (T_ctes_stream_C <= T_target + 1e-9):
+				m_ctes_cap = 0.0
+				A_ctes = -1.0
+
+			if RHS <= 1e-9:
+				return 0.0, 0.0, float(m_req), float(m_req), np.nan, float(T_target), True, 'no_heating_required'
+
+			if max(A_col, A_ctes) <= 1e-9:
+				return 0.0, 0.0, 0.0, 0.0, np.nan, np.nan, False, 'no_hot_source'
+
+			# Search feasible solutions for A_col*m_col + A_ctes*m_ctes = RHS.
+			feasible = []
+			if A_ctes > 1e-9:
+				for m_col_try in np.linspace(0.0, m_col_cap, 81):
+					m_ctes_try = (RHS - A_col * m_col_try) / A_ctes
+					if m_ctes_try < -1e-9:
+						continue
+					if m_ctes_try > (m_ctes_cap + 1e-9):
+						continue
+					if (m_col_try + m_ctes_try) > (float(m_req) + 1e-9):
+						continue
+					feasible.append((float(m_col_try), float(max(0.0, m_ctes_try))))
+			elif A_col > 1e-9:
+				m_col_try = RHS / A_col
+				if (m_col_try >= -1e-9) and (m_col_try <= m_col_cap + 1e-9) and (m_col_try <= float(m_req) + 1e-9):
+					feasible.append((float(max(0.0, m_col_try)), 0.0))
+
+			if len(feasible) == 0:
+				return 0.0, 0.0, 0.0, 0.0, np.nan, np.nan, False, 'no_feasible_split'
+
+			split_policy = 'collector_priority'
+			if (m_col_cap > 1e-12) and (m_ctes_cap > 1e-12):
+				# Preserve collector headroom for Mode-D charging by preferring the
+				# minimum collector share that still satisfies HEX target/flow.
+				feasible.sort(key=lambda p: (p[0], -p[1]))
+				split_policy = 'charge_priority'
+			else:
+				# Collector-only or CTES-disabled: keep collector-first behavior.
+				feasible.sort(key=lambda p: (p[0], -p[1]), reverse=True)
+			m_col_loc, m_ctes_loc = feasible[0]
+			m_recirc_loc = max(0.0, float(m_req) - (m_col_loc + m_ctes_loc))
+			m_oil_loc = float(m_req)
+
+			T_mix_ext_loc = _safe_mix_temp(m_col_loc, T_col, m_ctes_loc, T_ctes_stream_C, htf_in_temp_C)
+			T_mix_loc = (
+				(m_col_loc * (float(T_col) if np.isfinite(T_col) else 0.0))
+				+ (m_ctes_loc * (float(T_ctes_stream_C) if np.isfinite(T_ctes_stream_C) else 0.0))
+				+ (m_recirc_loc * T_ret)
+			) / max(1e-12, m_oil_loc)
+
+			if abs(T_mix_loc - T_target) > target_tol_C:
+				return 0.0, 0.0, 0.0, 0.0, np.nan, np.nan, False, 'target_not_met'
+
+			reason = 'ok_recirc' if m_recirc_loc > 1e-9 else 'ok_direct'
+			if (m_ctes_cap <= 1e-12) and (m_ctes_loc <= 1e-12):
+				reason = reason + '_ctes_dropped'
+			elif split_policy == 'charge_priority':
+				reason = reason + '_charge_priority'
+			return m_col_loc, m_ctes_loc, m_recirc_loc, m_oil_loc, T_mix_ext_loc, float(T_target), True, reason
+
+		m_col_use, m_ctes_use, m_recirc, m_oil_hex, T_mix_ext, T_mix, hex_target_enforced, hex_enforce_reason = _enforce_hex_target_with_recirculation(
+			m_col_use,
+			m_ctes_use,
+			T_ctes,
+			prev_hex_recirc_flow_m3s,
+		)
+		# Robust fallback: if gate failed but collector is hot enough, enforce target
+		# with a collector+recirculation split using nominal HEX return at target.
+		if (
+			factory_active
+			and (not hex_target_enforced)
+			and (m_col_avail > 1e-9)
+			and np.isfinite(T_col)
+			and (T_col > mix_target_used_C + 0.25)
+		):
+			T_ret_nom_fb = _estimate_oil_return_at_target(mix_target_used_C, m_req)
+			delta_hot_fb = max(0.0, float(T_col) - float(mix_target_used_C))
+			delta_cool_fb = float(mix_target_used_C) - float(T_ret_nom_fb)
+			if delta_cool_fb > 1e-6:
+				m_ext_req_fb = float(m_req) * delta_cool_fb / max(1e-9, (delta_cool_fb + delta_hot_fb))
+				m_col_fb = float(np.clip(m_ext_req_fb, 0.0, min(float(m_col_avail), float(m_req))))
+				m_recirc_fb = max(0.0, float(m_req) - m_col_fb)
+				T_mix_fb = ((m_col_fb * float(T_col)) + (m_recirc_fb * float(T_ret_nom_fb))) / max(1e-12, float(m_req))
+				if (m_col_fb > 1e-9) and (m_recirc_fb > 1e-9) and (abs(T_mix_fb - float(mix_target_used_C)) <= 0.5):
+					m_col_use = m_col_fb
+					m_ctes_use = 0.0
+					m_recirc = m_recirc_fb
+					m_oil_hex = float(m_req)
+					T_mix_ext = float(T_col)
+					T_mix = float(mix_target_used_C)
+					hex_target_enforced = True
+					hex_enforce_reason = 'collector_fallback_solve'
+		denom_ext = max(0.0, m_col_use + m_ctes_use)
+		if not hex_target_enforced:
+			hex_temp_sufficient = False
+
 		# call the detailed oil-water HEX model to see how much power can be delivered
 		oil_out_C, provided_W, water_out_C = oil_water_hex(
 			oil_in_C=T_mix,
@@ -819,42 +1188,7 @@ def simulate(
 				pinch_delta=pinch_delta_C,
 		)
 
-		# Recirculation iteration: use spare HEX flow capacity (m_req - external flow)
-		# and maximize recirculation toward the active HEX inlet target.
-		if factory_active and m_req > 0 and denom_ext > 1e-12:
-			m_recirc_cap = max(0.0, m_req - denom_ext)
-			if m_recirc_cap > 1e-12:
-				for _ in range(4):
-					if np.isnan(oil_out_C):
-						break
-					T_recirc_ref = float(oil_out_C)
-					# Recirculation helps whenever return is cooler than external supply.
-					if T_mix <= mix_target_used_C + 1e-9:
-						break
-					if T_recirc_ref >= T_mix_ext - 1e-9:
-						break
-					if T_recirc_ref < mix_target_used_C - 1e-9:
-						# enough cooling potential exists to possibly hit target
-						m_need = denom_ext * (T_mix_ext - mix_target_used_C) / max(1e-12, (mix_target_used_C - T_recirc_ref))
-						m_recirc_new = float(np.clip(m_need, 0.0, m_recirc_cap))
-					else:
-						# return is still above target: use all available spare flow for best-effort cooling
-						m_recirc_new = float(m_recirc_cap)
-					if abs(m_recirc_new - m_recirc) < 1e-10:
-						break
-					m_recirc = m_recirc_new
-					m_oil_hex = denom_ext + m_recirc
-					T_mix = ((denom_ext * T_mix_ext) + (m_recirc * T_recirc_ref)) / max(1e-12, m_oil_hex)
-					required_oil_in_C, hex_temp_sufficient = _compute_hex_required_inlet(T_mix, m_oil_hex)
-					oil_out_C, provided_W, water_out_C = oil_water_hex(
-						oil_in_C=T_mix,
-						oil_flow_m3s=m_oil_hex,
-						desired_water_power_W=desired_water_power_W if factory_active else 0.0,
-						water_vol_flow_m3s=(factory_water_flow_m3s if factory_active else None),
-						water_in_C=factory_water_in_C,
-						water_target_C=(water_target_used_C if factory_active else None),
-						pinch_delta=pinch_delta_C,
-					)
+		# Recirculation is already solved above to enforce the active HEX inlet target.
 
 		# If HEX couldn't meet the full demand and a backup heater would be needed,
 		# allow a relaxed pinch (10 C) and re-evaluate to see if that reduces backup heater use.
@@ -1047,24 +1381,17 @@ def simulate(
 			T_ctes_post = (T_outlet(ctes_y, 'discharging') if (ctes_y is not None and T_outlet is not None) else T_ctes)
 			if np.isnan(T_ctes_post):
 				T_ctes_post = T_ctes
-			T_mix_ext_post = _safe_mix_temp(m_col_use, T_col, m_ctes_use, T_ctes_post, htf_in_temp_C)
-			m_recirc_cap_post = max(0.0, m_req - denom_ext_post)
-			m_recirc_post = 0.0
-			T_mix_post = T_mix_ext_post
-			if m_recirc_cap_post > 1e-12 and not np.isnan(oil_out_C):
-				T_recirc_post = float(oil_out_C)
-				if (T_mix_ext_post > mix_target_used_C + 1e-9) and (T_recirc_post < T_mix_ext_post - 1e-9):
-					if T_recirc_post < mix_target_used_C - 1e-9:
-						m_need_post = denom_ext_post * (T_mix_ext_post - mix_target_used_C) / max(1e-12, (mix_target_used_C - T_recirc_post))
-						m_recirc_post = float(np.clip(m_need_post, 0.0, m_recirc_cap_post))
-					else:
-						m_recirc_post = float(m_recirc_cap_post)
-					m_oil_hex_post = denom_ext_post + m_recirc_post
-					T_mix_post = ((denom_ext_post * T_mix_ext_post) + (m_recirc_post * T_recirc_post)) / max(1e-12, m_oil_hex_post)
-				else:
-					m_oil_hex_post = denom_ext_post
-			else:
-				m_oil_hex_post = denom_ext_post
+			m_col_post = m_col_use
+			m_ctes_post = m_ctes_use
+			m_col_post, m_ctes_post, m_recirc_post, m_oil_hex_post, T_mix_ext_post, T_mix_post, _, hex_enforce_reason_post = _enforce_hex_target_with_recirculation(
+				m_col_post,
+				m_ctes_post,
+				T_ctes_post,
+				m_recirc,
+			)
+			m_col_use = m_col_post
+			m_ctes_use = m_ctes_post
+			hex_enforce_reason = hex_enforce_reason_post
 
 			if (abs(m_recirc_post - m_recirc) > 1e-10) or (abs(T_mix_post - T_mix) > 1e-9) or (abs(m_oil_hex_post - m_oil_hex) > 1e-10):
 				m_recirc = m_recirc_post
@@ -1119,6 +1446,25 @@ def simulate(
 		# Summarize the dominant CTES flow limiter for debug visibility.
 		eps_flow = 1e-9
 		if not factory_active:
+			mode_c_possible = False
+			mode_c_blocker = 'factory_off'
+		elif m_col_avail <= eps_flow:
+			mode_c_possible = False
+			mode_c_blocker = 'no_collector'
+		elif m_ctes_discharge_avail <= eps_flow:
+			mode_c_possible = False
+			mode_c_blocker = 'ctes_unavail'
+		elif (not np.isfinite(T_ctes)) or (T_ctes <= mix_target_used_C + 1e-9):
+			mode_c_possible = False
+			mode_c_blocker = 'ctes_too_cold'
+		elif hex_enforce_reason not in ('ok_direct', 'ok_recirc'):
+			mode_c_possible = False
+			mode_c_blocker = f"hex_{hex_enforce_reason}"
+		else:
+			mode_c_possible = True
+			mode_c_blocker = 'ok'
+
+		if not factory_active:
 			ctes_flow_limit_reason = 'factory_off'
 		elif m_ctes_discharge_avail <= eps_flow:
 			if (not ctes_discharge_enabled) or (not np.isnan(T_ctes) and T_ctes <= ctes_min_discharge_temp_C):
@@ -1154,7 +1500,148 @@ def simulate(
 				m_ctes_charge_avail = min(collector_left_for_charge, allowed_charge_flow)
 				if not disable_flow_rate_limits and max_ctes_flow_m3s is not None:
 					m_ctes_charge_avail = min(m_ctes_charge_avail, float(max_ctes_flow_m3s))
-				m_ctes_charge_use_m3s = float(m_ctes_charge_avail)
+
+				# Coupled charging solve: if collector inlet is inconsistent with predicted
+				# charging return, iterate within timestep and re-evaluate collector outlet/power.
+				if enable_inner_coupled_solver and factory_active and (m_ctes_charge_avail > 1e-9) and (m_col_vol_flow_m3s > 1e-9):
+					T_in_guess = float(collector_t_in_C if np.isfinite(collector_t_in_C) else htf_in_temp_C)
+					relax_cpl = float(np.clip(inner_solver_relaxation, 0.05, 0.95))
+					for it_idx in range(max(2, int(inner_solver_max_iter))):
+						coupled_charge_iters = int(it_idx + 1)
+						try:
+							col_cpl = solar_collector_outlet_temperature(
+								t_in=T_in_guess,
+								m_dot=m_col_vol_flow_m3s,
+								dni=float(dni_value) if not pd.isna(dni_value) else 0.0,
+								efficiency=collector_efficiency,
+								area=collector_area_m2,
+								volumetric=True,
+								temp_unit="C",
+							)
+							T_col_cpl = float(col_cpl.get("t_out_C", np.nan))
+						except Exception:
+							T_col_cpl = np.nan
+						if not np.isfinite(T_col_cpl):
+							T_col_cpl = T_in_guess
+
+						# Predict CTES charging outlet at provisional charging flow.
+						rho_cpl, _ = _htf_props_at(T_in_guess)
+						m_charge_mass_cpl = max(0.0, m_ctes_charge_avail) * rho_cpl
+						T_ctes_ret_cpl = T_in_guess
+						if m_charge_mass_cpl > 0.0:
+							try:
+								res_cpl = step_ctes(ctes_y, T_col_cpl, m_charge_mass_cpl, 'charging', timestep_seconds)
+								T_ctes_ret_cpl = float(res_cpl.get('T_out_C', T_in_guess))
+							except Exception:
+								T_ctes_ret_cpl = T_in_guess
+
+						ret_num_cpl = 0.0
+						ret_den_cpl = 0.0
+						if (m_oil_hex > 1e-9) and (not np.isnan(oil_out_C)):
+							ret_num_cpl += float(m_oil_hex) * float(oil_out_C)
+							ret_den_cpl += float(m_oil_hex)
+						if np.isfinite(T_ctes_ret_cpl) and (m_ctes_charge_avail > 1e-9):
+							ret_num_cpl += float(m_ctes_charge_avail) * float(T_ctes_ret_cpl)
+							ret_den_cpl += float(m_ctes_charge_avail)
+						if ret_den_cpl <= 1e-12:
+							break
+
+						T_in_new = (1.0 - relax_cpl) * T_in_guess + relax_cpl * (ret_num_cpl / ret_den_cpl)
+						coupled_charge_dTin_C = float(abs(T_in_new - T_in_guess))
+						T_in_guess = T_in_new
+						if coupled_charge_dTin_C < 0.05:
+							coupled_charge_converged = True
+							break
+
+					collector_t_in_C = float(T_in_guess)
+					# Re-evaluate collector at coupled inlet and update available solar for charging.
+					try:
+						col_res_cpl = solar_collector_outlet_temperature(
+							t_in=collector_t_in_C,
+							m_dot=m_col_vol_flow_m3s,
+							dni=float(dni_value) if not pd.isna(dni_value) else 0.0,
+							efficiency=collector_efficiency,
+							area=collector_area_m2,
+							volumetric=True,
+							temp_unit="C",
+						)
+						solar_power_W = float(col_res_cpl.get("power_W", 0.0))
+						collector_t_out_C = float(col_res_cpl.get("t_out_C", np.nan))
+						if solar_power_W <= 0.0:
+							collector_t_out_C = np.nan
+						if (not np.isnan(collector_t_out_C)) and (collector_t_out_C > max_htf_temp_C):
+							collector_t_out_C = float(max_htf_temp_C)
+							rho_cpl2, cp_cpl2 = _htf_props_at(collector_t_in_C)
+							solar_power_W = max(0.0, m_col_vol_flow_m3s * rho_cpl2 * cp_cpl2 * max(0.0, (collector_t_out_C - collector_t_in_C)))
+					except Exception:
+						solar_power_W = 0.0
+						collector_t_out_C = np.nan
+					collector_curtailment_W = max(0.0, solar_power_available_W - max(0.0, solar_power_W))
+					remaining_solar_W = max(0.0, solar_power_W - solar_contribution_W)
+				# Charging gate: compare inlet oil only against hottest SOLID node.
+				# Using full-state max (fluid+solid) can falsely block charging.
+				ctes_hottest_node_C = np.nan
+				if ctes_y is not None and extract_profiles is not None:
+					try:
+						_, T_s_profile = extract_profiles(ctes_y)
+						ctes_hottest_node_C = float(np.nanmax(np.asarray(T_s_profile, dtype=float)))
+					except Exception:
+						ctes_hottest_node_C = np.nan
+				ctes_hot_solid_C = ctes_hottest_node_C
+				T_in_quality_C = collector_t_out_C if not np.isnan(collector_t_out_C) else htf_in_temp_C
+				if np.isfinite(ctes_hottest_node_C):
+					T_ctes_chg_ref_C = float(ctes_hottest_node_C)
+				else:
+					try:
+						T_ctes_chg_ref_C = float(T_outlet(ctes_y, 'charging')) if T_outlet is not None else htf_in_temp_C
+					except Exception:
+						T_ctes_chg_ref_C = htf_in_temp_C
+				ctes_charge_margin_C = float(T_in_quality_C) - float(T_ctes_chg_ref_C)
+				charge_gate_tol_C = 0.01
+				if float(T_in_quality_C) <= float(T_ctes_chg_ref_C) + charge_gate_tol_C:
+					m_ctes_charge_avail = 0.0
+					ctes_charge_gate_reason = 'cold_inlet'
+				else:
+					ctes_charge_gate_reason = 'ok'
+				if enable_flow_optimizer and m_ctes_charge_avail > 0.0 and factory_active:
+					# Reduce charge flow when thermal driving force is weak to avoid
+					# low-quality HTF charging spikes near phase transitions.
+					charge_quality_dT_C = max(0.0, float(T_in_quality_C) - float(T_ctes_chg_ref_C))
+					raw_quality = charge_quality_dT_C / max(1e-9, charge_quality_target_dT_C)
+					charge_quality_factor = float(np.clip(raw_quality, charge_quality_min_flow_frac, 1.0))
+
+					# If factory demand is already satisfied and curtailment pressure is high,
+					# prioritize solar absorption into CTES over conservative quality throttling.
+					high_surplus_absorb_mode = bool(
+						(factory_deficit_W <= max(1e3, 1e-3 * max(1.0, factory_load_W)))
+						and (remaining_solar_W > max(2.0e5, 0.12 * max(1.0, solar_power_W)))
+					)
+					if high_surplus_absorb_mode:
+						charge_quality_factor = 1.0
+						m_cmd = float(m_ctes_charge_avail)
+					else:
+						m_cmd = float(m_ctes_charge_avail) * charge_quality_factor
+
+					# Slew limit the commanded charging flow to smooth start/end transients.
+					m_prev = float(prev_ctes_charge_flow_m3s)
+					m_low = max(0.0, m_prev - charge_slew_down_m3s_per_step)
+					if high_surplus_absorb_mode:
+						m_high = m_prev + max(charge_slew_up_m3s_per_step, 0.010)
+					else:
+						m_high = m_prev + charge_slew_up_m3s_per_step
+					m_slewed = float(np.clip(m_cmd, m_low, m_high))
+					charge_flow_slew_limited = bool(abs(m_slewed - m_cmd) > 1e-10)
+					m_ctes_charge_use_m3s = min(float(m_ctes_charge_avail), m_slewed)
+				else:
+					if not factory_active:
+						# When the factory is off, prioritize absorbing available solar into CTES.
+						# Do not apply quality/slew shaping here; thermal gate above still applies.
+						charge_quality_dT_C = float(T_in_quality_C) - float(T_ctes_chg_ref_C)
+						charge_quality_factor = 1.0
+						charge_flow_slew_limited = False
+					m_ctes_charge_use_m3s = float(m_ctes_charge_avail)
+				if m_ctes_charge_use_m3s <= 1e-12 and ctes_charge_gate_reason == 'ok':
+					ctes_charge_gate_reason = 'no_charge_flow'
 				m_ctes_charge_mass = m_ctes_charge_use_m3s * rho_htf if m_ctes_charge_use_m3s > 0 else 0.0
 				prev_E = ctes_energy_J
 				if m_ctes_charge_mass > 0:
@@ -1178,26 +1665,38 @@ def simulate(
 				# Charging input should represent heat transferred from HTF to CTES,
 				# not net storage rise (which can be negative when losses dominate).
 				actual_charge_W = 0.0
-				if isinstance(res_step, dict) and ('diag_q_to_solid_corr_W' in res_step):
-					# Net thermal power to solid storage; subtracts transient fluid inventory effects.
-					actual_charge_W = max(0.0, float(res_step.get('diag_q_to_solid_corr_W', 0.0)))
-				elif isinstance(res_step, dict) and ('diag_q_fluid_to_solid_total_W' in res_step):
-					actual_charge_W = max(0.0, float(res_step.get('diag_q_fluid_to_solid_total_W', 0.0)))
-				elif m_ctes_charge_mass > 0 and (T_in_for_ctes is not None) and (not np.isnan(last_ctes_T_out)):
-					try:
-						cp_charge = PropsSI("C", "T", ((T_in_for_ctes + last_ctes_T_out) / 2.0) + 273.15, "Q", 0, fluid)
-					except Exception:
-						cp_charge = cp_htf
-					cp_charge = max(float(cp_charge), 1e-9)
-					actual_charge_W = max(0.0, m_ctes_charge_mass * cp_charge * max(0.0, (T_in_for_ctes - last_ctes_T_out)))
+				q_htf_sensible_W = 0.0
+				if m_ctes_charge_mass > 0:
+					if (T_in_for_ctes is not None) and (not np.isnan(last_ctes_T_out)):
+						try:
+							cp_charge = PropsSI("C", "T", ((T_in_for_ctes + last_ctes_T_out) / 2.0) + 273.15, "Q", 0, fluid)
+						except Exception:
+							cp_charge = cp_htf
+						cp_charge = max(float(cp_charge), 1e-9)
+						q_htf_sensible_W = max(0.0, m_ctes_charge_mass * cp_charge * max(0.0, (T_in_for_ctes - last_ctes_T_out)))
+					# Primary sink for curtailment should be HTF sensible transfer with
+					# temperature-dependent cp; diagnostics are retained for closure checks.
+					if q_htf_sensible_W > 0.0:
+						actual_charge_W = q_htf_sensible_W
+					elif isinstance(res_step, dict) and ('diag_q_fluid_to_solid_total_W' in res_step):
+						actual_charge_W = max(0.0, float(res_step.get('diag_q_fluid_to_solid_total_W', 0.0)))
+					elif isinstance(res_step, dict) and ('diag_q_to_solid_corr_W' in res_step):
+						actual_charge_W = max(0.0, float(res_step.get('diag_q_to_solid_corr_W', 0.0)))
+				if isinstance(res_step, dict):
+					ctes_qf2s_total_W = float(res_step.get('diag_q_fluid_to_solid_total_W', np.nan))
+					ctes_q2solid_corr_W = float(res_step.get('diag_q_to_solid_corr_W', np.nan))
+				ctes_qhtf_sensible_W = float(q_htf_sensible_W)
 				actual_charge_display_W = min(max(0.0, remaining_solar_W), actual_charge_W)
-				if actual_charge_W > 0 and ctes_flow_dir == 'none':
+				prev_ctes_charge_flow_m3s = float(m_ctes_charge_use_m3s)
+				if (m_ctes_charge_mass > 0) and (actual_charge_W > 0) and ctes_flow_dir == 'none':
 					ctes_flow_dir = 'to_coll'
 			else:
 				actual_charge_W = remaining_solar_W
 				actual_charge_display_W = remaining_solar_W
 				if ctes_flow_dir == 'none':
 					ctes_flow_dir = 'to_coll'
+		else:
+			prev_ctes_charge_flow_m3s = 0.0
 
 		# If useful sinks are saturated (factory + CTES), curtail excess solar.
 		try:
@@ -1216,27 +1715,61 @@ def simulate(
 		remaining_solar_W = 0.0
 
 		# Determine operating mode letter for this timestep (after all allocations).
-		# A: collectors->CTES (factory off)
-		# B: collectors serve factory (optionally while charging CTES)
-		# C: collectors + CTES discharge serve factory
-		# D: CTES-only/night discharge serves factory
+		# Requested mapping:
+		# A: Collector -> CTES (factory off)
+		# B: CTES -> factory only (collectors bypassed)
+		# C: Combined supply (collectors + CTES -> factory)
+		# D: Combined supply + simultaneous charging (collectors + CTES -> factory, and collector -> CTES)
+		eps_power_W = 1e-3
+		col_to_hex_on = (solar_contribution_W > eps_power_W)
+		ctes_to_hex_on = (ctes_to_factory_W > eps_power_W)
+		col_to_ctes_on = (actual_charge_display_W > eps_power_W)
 		if not factory_active:
-			if actual_charge_display_W > 1e-6:
-				op_mode = 'A'
-			else:
-				op_mode = '-'
+			op_mode = 'A' if col_to_ctes_on else '-'
 		else:
-			if (m_col_use > 1e-9) and (m_ctes_use > 1e-9):
-				op_mode = 'C'
-			elif (m_col_use > 1e-9):
+			if (not col_to_hex_on) and ctes_to_hex_on:
 				op_mode = 'B'
-			elif (m_ctes_use > 1e-9):
+			elif col_to_hex_on and ctes_to_hex_on:
+				op_mode = 'D' if col_to_ctes_on else 'C'
+			elif col_to_hex_on and col_to_ctes_on:
+				# Keep mode continuity when CTES-to-factory is numerically tiny but
+				# collector serves factory while simultaneously charging CTES.
 				op_mode = 'D'
 			else:
 				op_mode = '-'
 		if backup_heater_W > 1e-6 and op_mode in ('A', 'B', 'C', 'D'):
 			op_mode = f"{op_mode}*"
 		hourly_mode_counts[op_mode] = int(hourly_mode_counts.get(op_mode, 0)) + 1
+
+		# Hourly non-debug diagnostics at first timestep of each hour.
+		if (not debug) and (not interactive) and (minute_of_hour < 10) and (curr_hour > last_hourly_diag_hour):
+			last_hourly_diag_hour = curr_hour
+			print(
+				f"Hourly diag {ts}: "
+				f"mode={op_mode}, "
+				f"solar_avail_kW={solar_power_available_W/1000.0:.1f}, "
+				f"solar_abs_kW={solar_power_W/1000.0:.1f}, "
+				f"to_hex_kW={solar_contribution_W/1000.0:.1f}, "
+				f"to_ctes_kW={actual_charge_display_W/1000.0:.1f}, "
+				f"curtail_kW={solar_curtailed_W/1000.0:.1f}, "
+				f"curtail_collector_kW={collector_curtailment_W/1000.0:.1f}, "
+				f"curtail_downstream_kW={downstream_curtail_W/1000.0:.1f}, "
+				f"factory_kW={factory_load_W/1000.0:.1f}, "
+				f"backup_kW={backup_heater_W/1000.0:.1f}, "
+				f"m_col_avail={m_col_avail:.4f}, "
+				f"m_chg={m_ctes_charge_use_m3s:.4f}, "
+				f"cpl_it={coupled_charge_iters}, "
+				f"cpl_ok={int(bool(coupled_charge_converged))}, "
+				f"cpl_dTin={coupled_charge_dTin_C if np.isfinite(coupled_charge_dTin_C) else float('nan'):.3f}, "
+				f"qhtf_kW={ctes_qhtf_sensible_W/1000.0 if np.isfinite(ctes_qhtf_sensible_W) else float('nan'):.1f}, "
+				f"qf2s_kW={ctes_qf2s_total_W/1000.0 if np.isfinite(ctes_qf2s_total_W) else float('nan'):.1f}, "
+				f"q2solid_kW={ctes_q2solid_corr_W/1000.0 if np.isfinite(ctes_q2solid_corr_W) else float('nan'):.1f}, "
+				f"hex_gate={hex_enforce_reason}, "
+				f"chg_gate={ctes_charge_gate_reason}, "
+				f"Tcol={collector_t_out_C if not np.isnan(collector_t_out_C) else float('nan'):.2f}C, "
+				f"Tctes_dis={T_ctes if not np.isnan(T_ctes) else float('nan'):.2f}C, "
+				f"Thot_solid={ctes_hot_solid_C if not np.isnan(ctes_hot_solid_C) else float('nan'):.2f}C"
+			)
 
 		# Always advance CTES in storage mode when no charge/discharge step occurred,
 		# so ambient losses are present from the beginning.
@@ -1266,6 +1799,7 @@ def simulate(
 		# only commit finite values
 		if np.isfinite(htf_in_next_C):
 			htf_in_temp_C = htf_in_next_C
+		prev_hex_recirc_flow_m3s = float(m_recirc) if m_recirc > 1e-12 else 0.0
 
 		net_power_W = remaining_solar_W - factory_deficit_W
 
@@ -1384,8 +1918,10 @@ def simulate(
 					print("  TEMP_C labels: return_htf, collector_out, hex_inlet, oil_outlet, ctes_inlet, ctes_outlet, water_inlet, water_outlet")
 					print("  FLOW_M3S labels: collector_av, collector_hex, collector_chg, ctes_to_hex, ctes_avail, recirculation, oil_hex")
 					print("  CTES_LIM labels: need_mix, need_pow, pre_clip, avail, post_clip, trim_red, ovf_red, fit_red, solver, op_mode, limiter")
+					print("  STATUS labels: ... modec_ok, modec_blk, hex_gate")
 					print("  CTES_ITR labels: mode, iter")
 					print("  COL_CTRL labels: collector_in, avail_eff, solver_iter, dTin, dMcol, converged")
+					print("  CHG_GATE labels: gate, hot_solid, dT_in_hot")
 					print("  POWER_KW labels: factory_load, solar_raw, solar_eff, solar_curt, hex_to_factory, ctes_to_factory, backup_heat, ctes_loss")
 					debug_table_header_printed = True
 				ts_table = ts.strftime('%Y-%m-%d %H:%M') if isinstance(ts, pd.Timestamp) else str(ts)
@@ -1423,7 +1959,7 @@ def simulate(
 					_cell_num('dTin', inner_solver_dTin_C, decimals=3),
 					_cell_num('dMcol', inner_solver_dm_col_m3s, decimals=6),
 					_cell_txt('converged', int(bool(inner_solver_converged))),
-					_cell_txt('---', ''),
+					_cell_txt('chg_tlim', int(bool(charge_flow_temp_limited))),
 				])
 				# power row includes the most relevant sink/source terms in kW
 				charging_kw_display = (actual_charge_display_W/1000.0) if 'actual_charge_display_W' in locals() else (actual_charge_W/1000.0)
@@ -1458,6 +1994,9 @@ def simulate(
 					_cell_txt('mode', ('fallback' if fallback_mode_active else 'primary')),
 					_cell_txt('hex_ok', int(bool(hex_temp_sufficient))),
 					_cell_txt('ctes_limit', ctes_avail_note),
+					_cell_txt('modec_ok', int(bool(mode_c_possible))),
+					_cell_txt('modec_blk', mode_c_blocker),
+					_cell_txt('hex_gate', hex_enforce_reason),
 				])
 				_print_row(ts_table, 'SHARE_PCT', [
 					_cell_num('solar_pct', solar_pct, decimals=1),
@@ -1486,6 +2025,15 @@ def simulate(
 					_cell_txt('mode', op_mode),
 					_cell_num('iter', iter_count_mode, decimals=0),
 					_cell_txt('---', ''),
+					_cell_txt('---', ''),
+					_cell_txt('---', ''),
+					_cell_txt('---', ''),
+					_cell_txt('---', ''),
+				])
+				_print_row(ts_table, 'CHG_GATE', [
+					_cell_txt('gate', ctes_charge_gate_reason),
+					_cell_num('hot_solid', ctes_hot_solid_C, decimals=2),
+					_cell_num('dT_in_hot', ctes_charge_margin_C, decimals=2),
 					_cell_txt('---', ''),
 					_cell_txt('---', ''),
 					_cell_txt('---', ''),
@@ -1604,23 +2152,30 @@ def simulate(
 		except Exception:
 			ctes_temp_csv = np.nan
 
-		# --- Per-module concrete temperatures (average and outlet) ---
+		# --- Per-module temperatures (solid avg/outlet and fluid at z=L) ---
 		if ctes_y is not None and extract_profiles is not None:
-			_, _T_s_all = extract_profiles(ctes_y)
-			_mod_avg = {
-				f"module_{i:02d}_Ts_avg_C": float(np.mean(_T_s_all[i * _CTES_N_z:(i + 1) * _CTES_N_z]))
-				for i in range(ctes_series_modules)
-			}
-			_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": float(_T_s_all[(i + 1) * _CTES_N_z - 1]) for i in range(ctes_series_modules)}
-			# Fluid temperature at z=L of each module (= fluid at interface between modules)
-			_mod_fluid = {f"module_{i:02d}_Tf_zL_C": float(_T_f_all[(i + 1) * _CTES_N_z - 1]) for i in range(ctes_series_modules)}
-			# Average concrete temperature per module (mean of all 30 axial nodes)
-			_mod_avg = {f"module_{i:02d}_Ts_avg_C": float(_T_s_all[i * _CTES_N_z:(i + 1) * _CTES_N_z].mean()) for i in range(ctes_series_modules)}
+			try:
+				_T_f_all, _T_s_all = extract_profiles(ctes_y)
+				_mod_avg = {
+					f"module_{i:02d}_Ts_avg_C": float(_T_s_all[i * _CTES_N_z:(i + 1) * _CTES_N_z].mean())
+					for i in range(ctes_series_modules)
+				}
+				_mod_outlets = {
+					f"module_{i:02d}_Ts_outlet_C": float(_T_s_all[(i + 1) * _CTES_N_z - 1])
+					for i in range(ctes_series_modules)
+				}
+				_mod_fluid = {
+					f"module_{i:02d}_Tf_zL_C": float(_T_f_all[(i + 1) * _CTES_N_z - 1])
+					for i in range(ctes_series_modules)
+				}
+			except Exception:
+				_mod_avg = {f"module_{i:02d}_Ts_avg_C": np.nan for i in range(ctes_series_modules)}
+				_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": np.nan for i in range(ctes_series_modules)}
+				_mod_fluid = {f"module_{i:02d}_Tf_zL_C": np.nan for i in range(ctes_series_modules)}
 		else:
 			_mod_avg = {f"module_{i:02d}_Ts_avg_C": np.nan for i in range(ctes_series_modules)}
 			_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": np.nan for i in range(ctes_series_modules)}
 			_mod_fluid = {f"module_{i:02d}_Tf_zL_C": np.nan for i in range(ctes_series_modules)}
-			_mod_avg = {f"module_{i:02d}_Ts_avg_C": np.nan for i in range(ctes_series_modules)}
 
 		records.append(
 			{
@@ -1652,6 +2207,9 @@ def simulate(
 				"m_col_use_m3s": m_col_use,
 				"m_ctes_use_m3s": m_ctes_use,
 				"m_ctes_charge_use_m3s": m_ctes_charge_use_m3s,
+				"charge_quality_dT_C": charge_quality_dT_C,
+				"charge_quality_factor": charge_quality_factor,
+				"charge_flow_slew_limited": bool(charge_flow_slew_limited),
 				"m_ctes_discharge_avail_m3s": m_ctes_discharge_avail,
 				"m_recirc_m3s": m_recirc,
 				"m_oil_hex_m3s": m_oil_hex,
@@ -1659,6 +2217,9 @@ def simulate(
 				"hex_inlet_temp_C": T_mix,
 				"mix_target_C": mix_target_used_C,
 				"mix_target_used_C": mix_target_used_C,
+				"hex_oil_out_target_primary_C": hex_oil_out_target_primary_C,
+				"hex_oil_out_target_fallback_C": hex_oil_out_target_fallback_C,
+				"hex_oil_out_target_used_C": hex_oil_out_target_used_C,
 				"collector_t_out_C": collector_t_out_C,
 				"oil_out_C": oil_out_C,
 				"water_out_C": water_out_C,
@@ -1691,7 +2252,10 @@ def simulate(
 				"tolerated_deficit_cumulative_MWh": cum_tolerated_deficit_J/3.6e9,
 				"ctes_loss_cumulative_MWh": cum_ctes_loss_J/3.6e9,
 				"ctes_current_loss_kW": current_loss_power_W/1000.0,
+				"solar_to_ctes_W": actual_charge_display_W,
 				"ctes_charge_htf_W": Q_in_htf_W,
+				"ctes_charge_raw_W": (ctes_qf2s_total_W if np.isfinite(ctes_qf2s_total_W) else np.nan),
+				"ctes_charge_net_W": (ctes_q2solid_corr_W if np.isfinite(ctes_q2solid_corr_W) else np.nan),
 				"ctes_charge_inferred_W": Q_in_inferred_W,
 				"ctes_charge_input_W": Q_in_to_ctes_W,
 				"ctes_discharge_output_W": Q_out_from_ctes_W,
@@ -1790,6 +2354,30 @@ def simulate(
 			f"avg={avg_iters:.2f}, "
 			f"max={max_ctes_discharge_iterations}"
 		)
+
+		# Automatically generate figures/tables after a successful simulation save.
+		if auto_run_presentation and out_path is not None:
+			try:
+				from ..features.data_presentation import plot_simulation_results
+			except Exception:
+				try:
+					from features.data_presentation import plot_simulation_results
+				except Exception:
+					plot_simulation_results = None
+
+			if plot_simulation_results is not None:
+				try:
+					plot_simulation_results(csv_path=out_path)
+					results_df.attrs['presentation_status'] = 'ok'
+					print("Data presentation completed.")
+				except Exception as e:
+					results_df.attrs['presentation_status'] = f'failed: {e}'
+					print(f"Data presentation failed: {e}")
+			else:
+				results_df.attrs['presentation_status'] = 'skipped: plot_simulation_results unavailable'
+				print("Data presentation skipped: plotting module unavailable.")
+		else:
+			results_df.attrs['presentation_status'] = 'disabled'
 	except Exception:
 		# best-effort: ignore if cannot write
 		out_path = None
@@ -1801,6 +2389,7 @@ if __name__ == "__main__":
 	print("This module provides `simulate()` for running the high-level CTES simulation loop.")
 	print("Call `simulate(dni_series_or_path, ...)` from your scripts or notebooks.")
 	# Quick smoke-run when invoked directly: use the provided DNI file and defaults
+	run_ok = False
 	try:
 		csv_in = 'src/data/DNI_10m.csv'
 		# if running in an interactive terminal, enable interactive prompts and debug
@@ -1809,28 +2398,16 @@ if __name__ == "__main__":
 		else:
 			results = simulate(csv_in)
 		print('Simulation finished.')
+		run_ok = True
 		csv_path = results.attrs.get('csv_path') if hasattr(results, 'attrs') else None
 		if csv_path:
 			print('Results saved to:', csv_path)
 	except Exception as e:
 		print('Simulation failed:', e)
 		csv_path = None
+	finally:
+		_play_completion_sound(success=run_ok)
 
-	# Try to plot results using data_presentation if available
-	try:
-		from ..features.data_presentation import plot_simulation_results
-	except Exception:
-		try:
-			from features.data_presentation import plot_simulation_results
-		except Exception:
-			plot_simulation_results = None
-
-	if plot_simulation_results is not None:
-		try:
-			plot_simulation_results(csv_path=csv_path)
-		except Exception as e:
-			print('Plotting failed:', e)
-	else:
-		print('Plotting function not available; CSV at', csv_path)
+	# Plotting/presentation is triggered automatically inside simulate() by default.
 
 

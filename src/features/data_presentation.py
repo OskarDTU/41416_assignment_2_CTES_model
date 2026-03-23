@@ -16,7 +16,7 @@ import pandas as pd
 
 DATA_DIR = os.path.normpath(os.path.join(os.path.dirname(__file__), '..', 'data'))
 
-FONT_SIZE = 10.5
+FONT_SIZE = 12.5
 FIG_WIDTH_A4 = 8.27
 
 
@@ -263,18 +263,22 @@ def plot_simulation_results(
     p_solar_raw = _series(df, 'solar_power_raw_W', 1 / 1000.0)
     p_solar_raw = p_solar_raw.where(p_solar_raw > 1e-6, 0.0)
     p_solar_to_hex = _series(df, 'solar_contribution_W', 1 / 1000.0)
-    # Use direct HTF->CTES charging channel for solar split plots.
-    p_solar_to_ctes = _series(df, 'ctes_charge_htf_W', 1 / 1000.0)
+    # Use solar-routed CTES charging for solar split plots.
+    p_solar_to_ctes = _series(df, 'solar_to_ctes_W', 1 / 1000.0)
     if p_solar_to_ctes.isna().all():
-        p_solar_to_ctes = _series(df, 'ctes_charge_input_W', 1 / 1000.0)
+        p_solar_to_ctes = _series(df, 'ctes_charge_htf_W', 1 / 1000.0)
     # "Used" collector power is the routed useful channels only.
     p_solar_used = (p_solar_to_hex + p_solar_to_ctes).clip(lower=0.0)
     p_solar_curt = _series(df, 'solar_power_curtailed_W', 1 / 1000.0)
     dni = _series(df, 'dni_W_m2', 1.0)
     dni = dni.where(dni > 1e-6, 0.0)
 
-    # CTES thermal powers [kW] with sign convention requested by user
-    p_ctes_chg = _series(df, 'ctes_charge_input_W', 1 / 1000.0)
+    # CTES thermal powers [kW] with sign convention requested by user.
+    # For charging, prefer routed solar->CTES channel so this panel is consistent
+    # with the collector split panel and avoids startup transients from inferred/model channels.
+    p_ctes_chg = _series(df, 'solar_to_ctes_W', 1 / 1000.0)
+    if p_ctes_chg.isna().all():
+        p_ctes_chg = _series(df, 'ctes_charge_input_W', 1 / 1000.0)
     p_ctes_dis = -_series(df, 'ctes_discharge_output_W', 1 / 1000.0)
     p_ctes_loss = _series(df, 'ctes_current_loss_kW', 1.0)
 
@@ -288,9 +292,21 @@ def plot_simulation_results(
     p_factory_backup = _series(df, 'backup_heater_kW', 1.0)
     p_factory_load = _series(df, 'factory_load_kW', 1.0)
 
-    f_col_total = _series(df, 'm_col_vol_flow_m3s', 1.0)
+    if 'operation_mode' in df.columns:
+        op_mode_raw = df['operation_mode'].astype(str).fillna('-')
+    else:
+        op_mode_raw = pd.Series('-', index=df.index, dtype=object)
+    op_mode_base = op_mode_raw.str.replace('*', '', regex=False)
+    op_mode_num = op_mode_base.map({'-': 0.0, 'A': 1.0, 'B': 2.0, 'C': 3.0, 'D': 4.0}).fillna(0.0)
+    # Treat backup as active in mode plot only above 40 kW.
+    op_mode_backup = (p_factory_backup > 40.0)
+
     f_col_hex = _series(df, 'm_col_use_m3s', 1.0)
     f_col_to_ctes = _series(df, 'm_ctes_charge_use_m3s', 1.0)
+    # Keep "Collector total" consistent with the plotted branch constituents.
+    # m_col_vol_flow_m3s is a commanded/available flow and can exceed routed flow
+    # during ramp shaping or curtailment.
+    f_col_total = (f_col_hex.fillna(0.0) + f_col_to_ctes.fillna(0.0))
     f_ctes_to_hex = _series(df, 'm_ctes_use_m3s', 1.0)
     f_recirc = _series(df, 'm_recirc_m3s', 1.0)
     flow_total = _series(df, 'm_oil_hex_m3s', 1.0).replace(0.0, np.nan)
@@ -317,7 +333,9 @@ def plot_simulation_results(
     p_ctes_charge_inf = _series(df, 'ctes_charge_inferred_W', 1 / 1000.0)
 
     p_solar_eff = _series(df, 'solar_power_effective_W', 1 / 1000.0)
-    p_col_to_ctes = _series(df, 'ctes_charge_htf_W', 1 / 1000.0)
+    p_col_to_ctes = _series(df, 'solar_to_ctes_W', 1 / 1000.0)
+    if p_col_to_ctes.isna().all():
+        p_col_to_ctes = _series(df, 'ctes_charge_htf_W', 1 / 1000.0)
 
     module_cols = _module_temp_columns(df)
     n_modules = len(module_cols)
@@ -329,7 +347,7 @@ def plot_simulation_results(
     module_norm_discrete = BoundaryNorm(np.arange(0.5, n_modules + 1.5, 1.0), module_cmap_discrete.N)
 
     def _draw_collector_power(ax, _fig=None):
-        ax.plot(df.index, p_solar_raw, label='Potential/DNI', lw=2.6, color='black')
+        ax.plot(df.index, p_solar_raw, label='Potential/DNI', lw=2.6, color='black', ls='--')
         ax.plot(df.index, p_solar_used, label='Used', lw=2.6)
         ax.plot(df.index, p_solar_to_hex, label='To HEX', lw=2.6)
         ax.plot(df.index, p_solar_to_ctes, label='To CTES', lw=2.6)
@@ -337,7 +355,7 @@ def plot_simulation_results(
         ax.set_ylabel('Collector power [kW]')
         ax.grid(True, alpha=0.3)
         axr = ax.twinx()
-        axr.plot(df.index, dni, color='black', lw=2.0, ls='-', label='_nolegend_')
+        axr.plot(df.index, dni, color='black', lw=2.0, ls='--', label='_nolegend_')
         axr.set_ylabel('DNI [W/m$^2$]')
         valid_ratio = (dni > 1e-9) & np.isfinite(dni) & np.isfinite(p_solar_raw)
         if valid_ratio.any():
@@ -356,6 +374,17 @@ def plot_simulation_results(
         ax.set_ylabel('CTES power [kW]')
         ax.grid(True, alpha=0.3)
         _legend_below(ax, ncol=3)
+
+    def _draw_op_mode(ax, _fig=None):
+        ax.step(df.index, op_mode_num, where='post', label='Operating mode', lw=2.4, color='tab:purple')
+        if op_mode_backup.any():
+            ax.scatter(df.index[op_mode_backup], op_mode_num[op_mode_backup], s=10, color='tab:red', label='Backup active', zorder=6)
+        ax.set_yticks([0, 1, 2, 3, 4])
+        ax.set_yticklabels(['-', 'A', 'B', 'C', 'D'])
+        ax.set_ylim(-0.3, 4.3)
+        ax.set_ylabel('Op mode [-]')
+        ax.grid(True, alpha=0.3)
+        _legend_below(ax, ncol=2)
 
     def _draw_soc(ax, _fig=None):
         ax.plot(df.index, soc_pct, lw=3.0, color='tab:blue', label='SoC')
@@ -405,6 +434,7 @@ def plot_simulation_results(
             cbar = fig.colorbar(sm, cax=cax, ticks=module_index)
             cbar.set_label('Module #')
             cbar.set_ticklabels([str(i) for i in module_index])
+            cbar.ax.invert_yaxis()
         else:
             ax.plot(df.index, _series(df, 'concrete_T_z0_C', 1.0), lw=2.2, color='tab:blue', label='z=0')
             ax.plot(df.index, _series(df, 'concrete_T_z_mid_C', 1.0), lw=2.2, color='tab:orange', label='z=mid')
@@ -414,7 +444,7 @@ def plot_simulation_results(
         ax.grid(True, alpha=0.3)
 
     def _draw_flow_rates(ax, _fig=None):
-        ax.plot(df.index, f_col_total, label='Collector total', lw=2.4)
+        ax.plot(df.index, f_col_total, label='Collector total', lw=2.8, color='black', ls='--', zorder=6)
         ax.plot(df.index, f_col_hex, label='Collector to HEX', lw=2.4)
         ax.plot(df.index, f_col_to_ctes, label='Collector to CTES', lw=2.4)
         ax.plot(df.index, f_ctes_to_hex, label='CTES to HEX', lw=2.4)
@@ -454,19 +484,20 @@ def plot_simulation_results(
 
     panels = [
         ('collector_power_and_dni.pdf', _draw_collector_power, 3.6),
+        ('operating_mode.pdf', _draw_op_mode, 2.8),
         ('ctes_thermal_power.pdf', _draw_ctes_power, 3.2),
-        ('ctes_soc_and_energy.pdf', _draw_soc, 3.2),
+        ('ctes_soc_and_energy.pdf', _draw_soc, 2.8),
         ('factory_power_sources.pdf', _draw_factory_power, 3.2),
-        ('htf_temperatures.pdf', _draw_htf_temps, 3.3),
+        ('htf_temperatures.pdf', _draw_htf_temps, 4.0),
         ('ctes_module_outlet_temperatures.pdf', _draw_module_temps, 3.4),
         ('htf_flow_rates.pdf', _draw_flow_rates, 3.2),
         ('hex_flow_share_percent.pdf', _draw_hex_shares, 3.2),
         ('ctes_charging_balance.pdf', _draw_ctes_charge_diag, 3.3),
-        ('collector_power_curtailment_vs_ctes.pdf', _draw_solar_diag, 3.3),
     ]
 
     for fname, drawer, fig_h in panels:
-        fig, ax = plt.subplots(1, 1, figsize=(fig_width, fig_h), sharex=True)
+        fig_width_this = (fig_width * 1.20) if fname == 'ctes_soc_and_energy.pdf' else fig_width
+        fig, ax = plt.subplots(1, 1, figsize=(fig_width_this, fig_h), sharex=True)
         drawer(ax, fig)
         _format_time_axis(ax, x0, x1)
         with warnings.catch_warnings():
