@@ -50,8 +50,8 @@ def exergy_flow(m_dot, T_K, Cp):
     return m_dot * Cp * ((T_K - T_o) - T_o * np.log(T_K / T_o))
 
 
-# Column names for the 14 module outlet temperatures saved by Part_1
-MODULE_COLS = [f"module_{i:02d}_Ts_outlet_C" for i in range(n_modules)]
+# Column names for the 14 module average temperatures saved by Part_1
+MODULE_COLS = [f"module_{i:02d}_Ts_avg_C" for i in range(n_modules)]
 
 
 def exergy_stored_14modules(df_modules_C):

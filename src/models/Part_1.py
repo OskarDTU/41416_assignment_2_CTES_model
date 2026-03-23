@@ -1612,9 +1612,15 @@ def simulate(
 				for i in range(ctes_series_modules)
 			}
 			_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": float(_T_s_all[(i + 1) * _CTES_N_z - 1]) for i in range(ctes_series_modules)}
+			# Fluid temperature at z=L of each module (= fluid at interface between modules)
+			_mod_fluid = {f"module_{i:02d}_Tf_zL_C": float(_T_f_all[(i + 1) * _CTES_N_z - 1]) for i in range(ctes_series_modules)}
+			# Average concrete temperature per module (mean of all 30 axial nodes)
+			_mod_avg = {f"module_{i:02d}_Ts_avg_C": float(_T_s_all[i * _CTES_N_z:(i + 1) * _CTES_N_z].mean()) for i in range(ctes_series_modules)}
 		else:
 			_mod_avg = {f"module_{i:02d}_Ts_avg_C": np.nan for i in range(ctes_series_modules)}
 			_mod_outlets = {f"module_{i:02d}_Ts_outlet_C": np.nan for i in range(ctes_series_modules)}
+			_mod_fluid = {f"module_{i:02d}_Tf_zL_C": np.nan for i in range(ctes_series_modules)}
+			_mod_avg = {f"module_{i:02d}_Ts_avg_C": np.nan for i in range(ctes_series_modules)}
 
 		records.append(
 			{
@@ -1694,6 +1700,8 @@ def simulate(
 				"hex_flow_balance_m3s": hex_flow_balance_m3s,
 				**_mod_avg,
 				**_mod_outlets,
+				**_mod_fluid,
+				**_mod_avg,
 			}
 		)
 
