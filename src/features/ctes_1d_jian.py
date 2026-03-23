@@ -97,7 +97,7 @@ eps_iso     = epsilon_iso          # [-]
 
 # n_pipes: used ONLY to derive r_eq and to scale energy to the full module.
 # It does NOT appear in the ODE — all equations are written on one equivalent element.
-n_pipes = 818
+n_pipes = 810
 
 # Concrete volume represented by one equivalent pipe-concrete element.
 V_eq  = V_con_total / (n_modules * n_pipes)   # [m3] concrete volume per equivalent element
