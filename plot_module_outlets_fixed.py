@@ -36,9 +36,7 @@ print("=" * 70)
 
 res = simulate(
     window,
-    initial_htf_inlet_temp_C=220.0,      # SOC 50%
-    initial_no_load_hours=0.0,
-    respect_factory_schedule=False,       # Ignore factory schedule
+    initial_htf_inlet_temp_C=220.0,      # SOC 50%respect_factory_schedule=False,       # Ignore factory schedule
     factory_off_on_weekends=False,        # Ensure factory OFF
     disable_flow_rate_limits=False,
     max_ctes_flow_m3s=0.03,

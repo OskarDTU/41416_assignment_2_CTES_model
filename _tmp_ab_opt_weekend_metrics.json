@@ -1,0 +1,18 @@
+{
+  "legacy": {
+    "curt_MWh": 6.914916644815577,
+    "chg_MWh": 17.33336534044109,
+    "mcol_med": 0.008058189163253902,
+    "mchg_med": 0.008058189163253902
+  },
+  "optimized": {
+    "curt_MWh": 4.305460461191286,
+    "chg_MWh": 19.942821524065376,
+    "mcol_med": 0.021,
+    "mchg_med": 0.021
+  },
+  "optimizer_mode_counts": {
+    "optimized": 49
+  },
+  "optimizer_evals_median": 7.0
+}

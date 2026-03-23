@@ -1,4 +1,4 @@
-﻿import pandas as pd
+import pandas as pd
 from src.models.Part_1 import simulate
 
 dni = pd.read_csv('src/data/DNI_10m.csv')
@@ -8,9 +8,7 @@ window = dni.loc['2026-07-11 00:00:00+00:00':'2026-07-18 00:00:00+00:00']
 
 res = simulate(
     window,
-    initial_htf_inlet_temp_C=130.0,  # <-- Here you choose the initial SOC (0% in this case)
-    initial_no_load_hours=0.0,
-    respect_factory_schedule=True,
+    initial_htf_inlet_temp_C=120.0,  # <-- Here you choose the initial SOC (0% in this case)respect_factory_schedule=True,
     factory_off_on_weekends=False,
     disable_flow_rate_limits=False,
     max_ctes_flow_m3s=0.03,
